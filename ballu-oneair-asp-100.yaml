@@ -1,0 +1,3698 @@
+# Ballu ONEAIR ASP-100
+#
+# Подтверждённая конфигурация:
+# - Шторка работает через ULN2003 и двигатель 28BYJ-48 на GPIO2/GPIO5/GPIO18/GPIO19.
+# - Вентилятор управляется частотой PWM на GPIO32, линия GPIO27 используется как разрешение запуска.
+# - Скорость вентилятора задаётся частотой PWM. Рабочий уровень PWM фиксирован.
+# - Режим Quiet использует 50 Hz, режим Turbo использует 500 Hz.
+# - Режимы Low, Medium и High настраиваются частотой.
+# - При переходе из Quiet в Medium/High/Turbo выполняется промежуточный запуск через Low.
+# - GPIO25 включает низкую ступень нагрева, GPIO25+GPIO26 включают высокую ступень нагрева.
+# - Нагревательные выходы отключаются при загрузке и при выключении вентилятора.
+# - Датчик на GPIO34 используется как датчик температуры приточного воздуха.
+# - Шторка представлена в Home Assistant как cover с положениями 0%, 25%, 75% и 100%.
+# - Один сегмент движения шторки равен oneair_shutter_steps. Полный ход равен трём сегментам.
+# - GPIO39 — датчик полностью закрытой шторки. Логический ON означает закрыто.
+# - GPIO36 — датчик полностью открытой шторки. Логический ON означает открыто.
+# - Динамик NS4168 работает по I2S: LRCLK GPIO15, BCLK GPIO13, SDATA GPIO14, правый канал.
+# - GPIO17 управляет шестью адресными светодиодами панели.
+# - Eco является стандартным preset-режимом climate.
+# - Физический запуск вентилятора выполняется после полного открытия шторки.
+# - Climate синхронизируется со скоростью вентилятора, положением шторки и состоянием нагрева.
+# - Auto использует датчик MH-Z19 PWM для выбора скорости вентилятора и индикации CO₂.
+# - Обогрев использует целевую температуру 5–25 °C, ступени Low/High и индикацию Heat.
+# - При выключении из режима обогрева сначала отключается нагрев, затем 60 секунд работает обдув High.
+# - Ночной режим отключает звуки, приглушает индикацию и ограничивает Auto скоростью Medium.
+# - Счётчики фильтров накапливают время работы вентилятора и сохраняются во flash не чаще одного раза за 12 часов.
+
+substitutions:
+  vendor: ballu
+  dev_name: oneair
+  model: asp-100
+
+  # Сенсорные кнопки / штатная панель
+  touch_speed: GPIO23       # D3: питание/переключение скоростей
+  touch_heat: GPIO22        # D5: нагрев
+  touch_night: GPIO21       # D4: ночной режим
+  # GPIO17 является линией данных для 6 адресных светодиодов панели.
+  # LED1 используется для индикации ночного режима и состояния CO₂.
+  panel_led_data_pin: GPIO17
+  panel_led_count: "6"
+  panel_led_chipset: ws2812
+  panel_led_rgb_order: GRB
+
+  # Шторка: ESP32 -> входы ULN2003G -> двигатель 28BYJ-48
+  shutter_in1: GPIO2        # ULN2003 IN1 -> OUT16 -> синий провод 28BYJ-48
+  shutter_in2: GPIO5        # ULN2003 IN2 -> OUT15 -> розовый провод 28BYJ-48
+  shutter_in3: GPIO18       # ULN2003 IN3 -> OUT14 -> желтый провод 28BYJ-48
+  shutter_in4: GPIO19       # ULN2003 IN4 -> OUT13 -> оранжевый провод 28BYJ-48
+
+  # Шторка имеет 4 рабочих положения для карточки cover Home Assistant:
+  # 0% = закрыто, 25% = 1 сегмент, 75% = 2 сегмента, 100% = 3 сегмента.
+  # Важно: shutter_steps означает ОДИН ход/сегмент.
+  # Полностью открыть из закрытого = 3 сегмента по shutter_steps.
+  # После срабатывания датчика закрытия выполняется небольшой дожим.
+  shutter_segment_delay: 3800ms
+  shutter_close_extra_delay: 1200ms
+  shutter_open_extra_delay: 1600ms
+
+  # Вентилятор / силовой блок
+  fan_pwm_pin: GPIO32       # черный провод силового блока: PWM скорости
+  fan_enable_pin: GPIO27    # коричневый провод силового блока: start/enable
+  fan_pwm_default_frequency: 100Hz
+  fan_pwm_run_level: 80%      # фиксированный рабочий level PWM; скорость регулируется частотой
+  fan_quiet_frequency: 50Hz   # фиксированный тихий режим
+  fan_turbo_frequency: 500Hz  # фиксированный турбо режим
+  fan_quiet_exit_ramp_delay: 1500ms  # переход Quiet -> Middle/High/Turbo через Low, чтобы мотор не останавливался
+
+  # Eco в preset_modes вентилятора
+  eco_min_temperature: "5.0"      # Eco разрешён только при температуре приточного воздуха >= +5 °C
+  eco_led_step_delay: 650ms
+  eco_led_brightness: 45%
+  speed_led_brightness: 45%
+  co2_led_brightness: 45%
+  co2_alarm_blink_period: 900ms
+
+  # Нагрев / PTC через CT3063
+  heater_1: GPIO25
+  heater_2: GPIO26
+  heater_start_delay: 4000ms  # задержка после автозапуска вентилятора перед включением нагрева
+  heat_led_brightness: 45%
+  heat_min_temperature: "5.0"
+  heat_default_target: "20.0"
+  heat_boost_target: "25.0"
+  heat_hysteresis: "0.4"
+  heat_high_delay_ms: "600000"     # 10 минут на Low перед переходом в High, если температура не растёт
+  heat_high_min_rise: "0.5"        # если за heat_high_delay_ms рост меньше 0.5 °C, разрешаем High
+  heat_shutdown_cooldown_delay: 60s # безопасный обдув High после выключения из режима обогрева
+
+  # Ночной режим
+  night_panel_dim_delay: 30s
+  night_led_awake_brightness: 35%
+  night_led_dim_brightness: 7%
+  night_speed_led_brightness: 18%
+  night_heat_led_brightness: 18%
+  ptc_heater_installed: "true"
+
+  # Датчики / диагностика
+  shutter_closed: GPIO39
+  # Концевики шторки
+  # GPIO39: логический ON = шторка полностью закрыта.
+  # GPIO36: сигнал инвертирован, логический ON = шторка полностью открыта.
+# После срабатывания датчика при открытии до 100% выполняется дожим shutter_open_extra_steps.
+  shutter_opened: GPIO36
+  temp_adc: GPIO34
+  mhz19_pwm: GPIO35
+
+  # Усилитель NS4168 I2S / штатный динамик
+  # По прозвонке:
+  # NS4168 pin 1 CTRL подтянут к 3.3V через 10k => включен, выбран Right channel.
+  # NS4168 pin 2 LRCLK -> GPIO15
+  # NS4168 pin 3 BCLK  -> GPIO13
+  # NS4168 pin 4 SDATA -> GPIO14
+  audio_lrclk_pin: GPIO15
+  audio_bclk_pin: GPIO13
+  audio_dout_pin: GPIO14
+  audio_gain: "0.60"
+
+  # Инверсии
+  fan_pwm_inverted: "true"
+  fan_enable_inverted: "false"
+  heater_inverted: "false"
+  # night_led_inverted не используется,
+  # потому что GPIO17 управляет адресными светодиодами панели.
+  night_led_inverted: "false"
+  touch_inverted: "true"
+
+esphome:
+  name: ${vendor}-${dev_name}-${model}
+  friendly_name: Ballu OneAir ASP-100
+  name_add_mac_suffix: true
+  on_boot:
+    priority: 700
+    then:
+      - logger.log: "Boot: fan and heater outputs forced OFF"
+      - script.execute: fan_all_off
+      - script.execute: heater_all_off
+      - light.turn_off: oneair_panel_leds_all
+      - fan.turn_off: fan_output
+      - lambda: |-
+          id(fan_running_flag) = false;
+          id(fan_last_speed) = 0;
+          id(fan_target_speed) = 0;
+          id(power_on_flag) = false;
+          id(eco_mode_flag) = false;
+          id(auto_mode_flag) = false;
+          id(fan_physical_allowed) = false;
+          id(fan_starting_sequence_flag) = false;
+          id(pending_fan_speed) = 2;
+          id(auto_mode_flag) = false;
+          id(auto_effective_speed) = 2;
+          id(heat_mode_request_level) = 0;
+          id(heat_cold_protect_flag) = false;
+          id(heat_target_temperature) = ${heat_default_target};
+          id(heat_low_started_ms) = 0;
+          id(heat_low_start_temperature) = NAN;
+          id(heat_high_escalated_flag) = false;
+          id(device_power_off_in_progress_flag) = false;
+          id(heat_shutdown_cooldown_needed_flag) = false;
+          id(night_display_awake_flag) = false;
+          id(speed_long_press_ignore_short_flag) = false;
+      # После загрузки виртуальное положение шторки синхронизируется по концевикам.
+      # Логический ON shutter_closed_sensor означает закрыто. Логический ON shutter_opened_sensor означает полностью открыто.
+      - delay: 2s
+      - if:
+          condition:
+            binary_sensor.is_on: shutter_closed_sensor
+          then:
+            - logger.log: "Загрузка: датчик закрытия активен; шторка и шаговый двигатель синхронизированы с закрытым положением"
+            - lambda: "id(shutter_position_segments) = 0;"
+            - stepper.report_position:
+                id: shutter_stepper
+                position: 0
+            - stepper.set_target:
+                id: shutter_stepper
+                target: 0
+            - cover.template.publish:
+                id: shutter_cover
+                position: 0.0
+                current_operation: IDLE
+            - script.execute: climate_publish_shutter_from_current_state
+          else:
+            - if:
+                condition:
+                  binary_sensor.is_on: shutter_opened_sensor
+                then:
+                  - logger.log: "Загрузка: датчик полного открытия активен; шторка и шаговый двигатель синхронизированы с полностью открытым положением"
+                  - lambda: |-
+                      id(shutter_opening_flag) = false;
+                      id(shutter_closing_flag) = false;
+                      id(shutter_position_segments) = 3;
+                  - stepper.report_position:
+                      id: shutter_stepper
+                      position: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+                  - stepper.set_target:
+                      id: shutter_stepper
+                      target: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+                  - cover.template.publish:
+                      id: shutter_cover
+                      position: 1.0
+                      current_operation: IDLE
+                  - script.execute: climate_publish_shutter_from_current_state
+                else:
+                  - lambda: |-
+                      if (id(shutter_position_segments) < 0 || id(shutter_position_segments) > 3) {
+                        id(shutter_position_segments) = 3;
+                      }
+                      // При первой загрузке после установки прошивки сохранённый сегмент отсутствует.
+                      // Если концевики не активны и сохранённый сегмент равен 0, используется состояние полностью открыто.
+                      if (id(shutter_position_segments) == 0) {
+                        id(shutter_position_segments) = 3;
+                      }
+                      ESP_LOGD("oneair", "Boot: shutter is between endstops; restored segment=%d", id(shutter_position_segments));
+                  - stepper.report_position:
+                      id: shutter_stepper
+                      position: !lambda "return (int) roundf(id(shutter_steps).state * id(shutter_position_segments));"
+                  - stepper.set_target:
+                      id: shutter_stepper
+                      target: !lambda "return (int) roundf(id(shutter_steps).state * id(shutter_position_segments));"
+                  - cover.template.publish:
+                      id: shutter_cover
+                      position: !lambda |-
+                        if (id(shutter_position_segments) <= 0) return 0.0f;
+                        if (id(shutter_position_segments) == 1) return 0.25f;
+                        if (id(shutter_position_segments) == 2) return 0.75f;
+                        return 1.0f;
+                      current_operation: IDLE
+                  - script.execute: climate_publish_shutter_from_current_state
+
+# Снижение износа flash: восстановимые значения сохраняются во flash не чаще одного раза за 12 часов.
+preferences:
+  flash_write_interval: 12h
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: ${vendor}-${dev_name}-${model}
+    password: "12345678"
+
+captive_portal:
+
+web_server:
+  local: true
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [ ballu_oneair_climate ]
+
+# NS4168: моноусилитель Class-D по I2S.
+# Вывод CTRL подтянут к HIGH на плате, поэтому NS4168 использует правый канал.
+# Динамик настроен на channel: right.
+i2s_audio:
+  - id: oneair_i2s_audio
+    i2s_lrclk_pin: ${audio_lrclk_pin}
+    i2s_bclk_pin: ${audio_bclk_pin}
+
+speaker:
+  - platform: i2s_audio
+    id: oneair_speaker
+    i2s_audio_id: oneair_i2s_audio
+    dac_type: external
+    i2s_dout_pin: ${audio_dout_pin}
+    channel: right
+    sample_rate: 48000
+    bits_per_sample: 16bit
+    i2s_comm_fmt: stand_i2s
+    use_apll: true
+    timeout: never
+
+rtttl:
+  id: oneair_rtttl
+  speaker: oneair_speaker
+  gain: ${audio_gain}
+
+globals:
+  - id: fan_running_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: fan_last_speed
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: fan_target_speed
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: heater_stage_1_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: heater_stage_2_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: shutter_closing_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: shutter_opening_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Текущее положение шторки в сегментах:
+  # 0 = закрыто, 1 = 25%, 2 = 75%, 3 = полностью открыто.
+  # Сохраняется во flash, чтобы cover знал, сколько сегментов уже было сделано.
+  - id: shutter_position_segments
+    type: int
+    restore_value: yes
+    initial_value: '0'
+
+  - id: shutter_start_segments
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: shutter_target_segments
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  # Общий режим устройства. Нужен, чтобы обычное выключение закрывало шторку,
+  # а включение открывало её и запускало активную вентиляцию.
+  - id: power_on_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Eco = пассивное проветривание: шторка открыта, вентилятор и нагрев выключены.
+  - id: eco_mode_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Разрешение физического запуска вентилятора. Нужно, чтобы при включении fan
+  # сначала полностью открывать шторку, и только потом подавать PWM на мотор.
+  - id: fan_physical_allowed
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: fan_starting_sequence_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: pending_fan_speed
+    type: int
+    restore_value: no
+    initial_value: '2'
+
+  # Автоматический режим вентилятора: скорость выбирается по уровню CO₂ от MH-Z19.
+  - id: auto_mode_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: auto_effective_speed
+    type: int
+    restore_value: no
+    initial_value: '2'
+
+  # Состояние целевой температуры обогрева:
+  # 0 = обогрев выключен, 1 = цель 20 °C, 2 = цель 25 °C, 3 = защита от холода +5 °C.
+  - id: heat_mode_request_level
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: heat_cold_protect_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: heat_target_temperature
+    type: float
+    restore_value: yes
+    initial_value: '20.0'
+
+  - id: heat_low_started_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: heat_low_start_temperature
+    type: float
+    restore_value: no
+    initial_value: 'NAN'
+
+  - id: heat_high_escalated_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Внутренняя защита: блокирует повторный запуск сценария выключения из fan.on_turn_off
+  # во время безопасной продувки после обогрева.
+  - id: device_power_off_in_progress_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  - id: heat_shutdown_cooldown_needed_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Ночной режим: если флаг false и night_mode включён, первое касание только включает подсветку.
+  - id: night_display_awake_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Устанавливается после долгого удержания Speed для выключения.
+  # Сырой сенсор кнопки формирует событие короткого нажатия при отпускании;
+  # этот флаг блокирует одно такое событие, чтобы бризер не включился обратно.
+  - id: speed_long_press_ignore_short_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Устанавливается после долгого удержания Night для включения Eco.
+  # Этот флаг блокирует обычное короткое действие Night при отпускании.
+  - id: night_long_press_ignore_short_flag
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
+  # Счётчики наработки фильтров.
+  # Учитывается только время физической работы вентилятора с прокачкой воздуха через фильтры.
+  # Внутри хранится в секундах, в Home Assistant отображается в часах.
+  - id: prefilter_runtime_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
+  - id: main_filter_runtime_seconds
+    type: uint32_t
+    restore_value: yes
+    initial_value: '0'
+
+output:
+  # GPIO32: PWM/скорость вентилятора.
+  # Инвертированная PWM-линия использует логические 100% как физический стоп-уровень.
+  - platform: ledc
+    id: fan_pwm_out
+    frequency: ${fan_pwm_default_frequency}
+    pin:
+      number: ${fan_pwm_pin}
+      inverted: ${fan_pwm_inverted}
+
+  # GPIO27: линия запуска/разрешения вентилятора.
+  - platform: ledc
+    id: fan_enable_out
+    frequency: ${fan_pwm_default_frequency}
+    pin:
+      number: ${fan_enable_pin}
+      inverted: ${fan_enable_inverted}
+
+  # Нагрев PTC. GPIO25 = Low (~360 W), GPIO25+GPIO26 = High (~880 W).
+  - platform: gpio
+    id: heater_1_out
+    pin:
+      number: ${heater_1}
+      inverted: ${heater_inverted}
+
+  - platform: gpio
+    id: heater_2_out
+    pin:
+      number: ${heater_2}
+      inverted: ${heater_inverted}
+
+
+  # Выход, которым управляет платформа fan.
+  # speed_count: 5 -> state примерно 0.2 / 0.4 / 0.6 / 0.8 / 1.0.
+  # Скорость вентилятора регулируется только частотой PWM.
+  # Duty/level фиксирован, так как тесты показали, что изменение duty не меняет скорость.
+  # Важно: если шторка ещё не открыта, физический запуск вентилятора блокируется,
+  # запоминается требуемая скорость, шторка открывается полностью и только потом подаётся PWM.
+  - platform: template
+    id: fan_speed_output
+    type: float
+    write_action:
+      - if:
+          condition:
+            lambda: "return state <= 0.0f;"
+          then:
+            - logger.log: "Fan OFF: drive PWM to stop level and disable enable line"
+            - script.execute: fan_all_off
+          else:
+            - lambda: |-
+                if (state <= 0.21f) {
+                  id(fan_target_speed) = 1;       // Quiet
+                } else if (state <= 0.41f) {
+                  id(fan_target_speed) = 2;       // Low
+                } else if (state <= 0.61f) {
+                  id(fan_target_speed) = 3;       // Middle
+                } else if (state <= 0.81f) {
+                  id(fan_target_speed) = 4;       // High
+                } else {
+                  id(fan_target_speed) = 5;       // Turbo
+                }
+                if (id(heat_mode_request_level) > 0 && id(fan_target_speed) == 1) {
+                  ESP_LOGW("oneair", "Fan QUIET blocked while heat target is active; using LOW for heater safety");
+                  id(fan_target_speed) = 2;
+                }
+                id(pending_fan_speed) = id(fan_target_speed);
+                ESP_LOGD("oneair", "Fan requested: state=%.3f target_speed=%d last_speed=%d running=%s eco=%s shutter_open=%s allowed=%s",
+                         state, id(fan_target_speed), id(fan_last_speed),
+                         id(fan_running_flag) ? "true" : "false",
+                         id(eco_mode_flag) ? "true" : "false",
+                         id(shutter_opened_sensor).state ? "true" : "false",
+                         id(fan_physical_allowed) ? "true" : "false");
+            - if:
+                condition:
+                  lambda: "return id(eco_mode_flag);"
+                then:
+                  - logger.log: "Fan output request ignored physically because Eco preset is active"
+                  - script.execute: fan_physical_off
+                else:
+                  - if:
+                      condition:
+                        lambda: "return !id(shutter_opened_sensor).state && !id(fan_physical_allowed);"
+                      then:
+                        - logger.log: "Fan physical start is blocked until shutter is fully open"
+                        - script.execute: fan_physical_off
+                        - if:
+                            condition:
+                              lambda: "return !id(fan_starting_sequence_flag);"
+                            then:
+                              - script.execute: active_fan_start_after_shutter
+                      else:
+                        - lambda: |-
+                            id(power_on_flag) = true;
+                            id(eco_mode_flag) = false;
+                            id(fan_physical_allowed) = true;
+                        - output.set_level:
+                            id: fan_enable_out
+                            level: 100%
+                        - if:
+                            condition:
+                              lambda: "return !id(fan_running_flag);"
+                            then:
+                              - logger.log: "Fan start boost: configured start frequency, fixed PWM level"
+                              - output.ledc.set_frequency:
+                                  id: fan_pwm_out
+                                  frequency: !lambda "return id(fan_start_freq).state;"
+                              - output.set_level:
+                                  id: fan_pwm_out
+                                  level: ${fan_pwm_run_level}
+                              - delay: 1200ms
+                        # После Quiet прямой переход на Middle/High/Turbo приводит к остановке мотора.
+                        # Поэтому сначала кратко поднимаем его через Low-частоту, затем ставим целевой режим.
+                        - if:
+                            condition:
+                              lambda: "return id(fan_running_flag) && id(fan_last_speed) == 1 && id(fan_target_speed) > 2;"
+                            then:
+                              - logger.log: "Fan transition from QUIET: ramp via LOW before target mode"
+                              - output.ledc.set_frequency:
+                                  id: fan_pwm_out
+                                  frequency: !lambda "return id(fan_low_freq).state;"
+                              - output.set_level:
+                                  id: fan_pwm_out
+                                  level: ${fan_pwm_run_level}
+                              - delay: ${fan_quiet_exit_ramp_delay}
+                              - if:
+                                  condition:
+                                    lambda: "return id(fan_target_speed) > 3;"
+                                  then:
+                                    - logger.log: "Fan transition from QUIET: additional ramp via MIDDLE"
+                                    - output.ledc.set_frequency:
+                                        id: fan_pwm_out
+                                        frequency: !lambda "return id(fan_middle_freq).state;"
+                                    - output.set_level:
+                                        id: fan_pwm_out
+                                        level: ${fan_pwm_run_level}
+                                    - delay: 800ms
+                              - if:
+                                  condition:
+                                    lambda: "return id(fan_target_speed) > 4;"
+                                  then:
+                                    - logger.log: "Fan transition from QUIET: additional ramp via HIGH"
+                                    - output.ledc.set_frequency:
+                                        id: fan_pwm_out
+                                        frequency: !lambda "return id(fan_high_freq).state;"
+                                    - output.set_level:
+                                        id: fan_pwm_out
+                                        level: ${fan_pwm_run_level}
+                                    - delay: 800ms
+                        - if:
+                            condition:
+                              lambda: "return id(fan_target_speed) == 1;"
+                            then:
+                              - output.ledc.set_frequency:
+                                  id: fan_pwm_out
+                                  frequency: ${fan_quiet_frequency}
+                              - output.set_level:
+                                  id: fan_pwm_out
+                                  level: ${fan_pwm_run_level}
+                              - logger.log: "Fan QUIET: fixed freq=${fan_quiet_frequency}"
+                        - if:
+                            condition:
+                              lambda: "return id(fan_target_speed) == 2;"
+                            then:
+                              - output.ledc.set_frequency:
+                                  id: fan_pwm_out
+                                  frequency: !lambda "return id(fan_low_freq).state;"
+                              - output.set_level:
+                                  id: fan_pwm_out
+                                  level: ${fan_pwm_run_level}
+                              - lambda: |-
+                                  ESP_LOGD("oneair", "Fan LOW: freq=%.0f Hz", id(fan_low_freq).state);
+                        - if:
+                            condition:
+                              lambda: "return id(fan_target_speed) == 3;"
+                            then:
+                              - output.ledc.set_frequency:
+                                  id: fan_pwm_out
+                                  frequency: !lambda "return id(fan_middle_freq).state;"
+                              - output.set_level:
+                                  id: fan_pwm_out
+                                  level: ${fan_pwm_run_level}
+                              - lambda: |-
+                                  ESP_LOGD("oneair", "Fan MIDDLE: freq=%.0f Hz", id(fan_middle_freq).state);
+                        - if:
+                            condition:
+                              lambda: "return id(fan_target_speed) == 4;"
+                            then:
+                              - output.ledc.set_frequency:
+                                  id: fan_pwm_out
+                                  frequency: !lambda "return id(fan_high_freq).state;"
+                              - output.set_level:
+                                  id: fan_pwm_out
+                                  level: ${fan_pwm_run_level}
+                              - lambda: |-
+                                  ESP_LOGD("oneair", "Fan HIGH: freq=%.0f Hz", id(fan_high_freq).state);
+                        - if:
+                            condition:
+                              lambda: "return id(fan_target_speed) == 5;"
+                            then:
+                              - output.ledc.set_frequency:
+                                  id: fan_pwm_out
+                                  frequency: ${fan_turbo_frequency}
+                              - output.set_level:
+                                  id: fan_pwm_out
+                                  level: ${fan_pwm_run_level}
+                              - logger.log: "Fan TURBO: fixed freq=${fan_turbo_frequency}"
+                        - lambda: |-
+                            id(fan_last_speed) = id(fan_target_speed);
+                            id(fan_running_flag) = true;
+                        - script.execute: climate_publish_from_current_state
+                        - script.execute: co2_night_led_update
+stepper:
+  - platform: uln2003
+    id: shutter_stepper
+    pin_a: ${shutter_in1}
+    pin_b: ${shutter_in2}
+    pin_c: ${shutter_in3}
+    pin_d: ${shutter_in4}
+    max_speed: 180 steps/s
+    acceleration: 180 steps/s^2
+    deceleration: 180 steps/s^2
+    sleep_when_done: true
+    step_mode: HALF_STEP
+
+number:
+  - platform: template
+    id: shutter_steps
+    name: ${dev_name}_shutter_steps
+    internal: true
+    icon: "mdi:debug-step-over"
+    min_value: 100
+    max_value: 2000
+    step: 50
+    initial_value: 500
+    restore_value: true
+    optimistic: true
+    entity_category: config
+
+
+  - platform: template
+    id: shutter_close_extra_steps
+    name: ${dev_name}_shutter_close_extra_steps
+    internal: true
+    icon: "mdi:arrow-collapse-down"
+    min_value: 0
+    max_value: 300
+    step: 10
+    initial_value: 60
+    restore_value: true
+    optimistic: true
+    entity_category: config
+
+  - platform: template
+    id: shutter_open_extra_steps
+    name: ${dev_name}_shutter_open_extra_steps
+    internal: true
+    icon: "mdi:arrow-expand-up"
+    min_value: 0
+    max_value: 500
+    step: 10
+    initial_value: 200
+    restore_value: true
+    optimistic: true
+    entity_category: config
+
+  # Стартовый режим: короткий разгон на заданной частоте, потом переход на выбранный режим.
+  - platform: template
+    id: fan_start_freq
+    name: ${dev_name}_fan_start_freq
+    internal: true
+    icon: "mdi:sine-wave"
+    min_value: 50
+    max_value: 1000
+    step: 10
+    initial_value: 160
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: "Hz"
+    entity_category: config
+
+  # Частоты основных режимов вентилятора. Quiet/Turbo фиксированы в substitutions.
+  - platform: template
+    id: fan_low_freq
+    name: Fan Low Frequency
+    icon: "mdi:fan-speed-1"
+    min_value: 50
+    max_value: 400
+    step: 10
+    initial_value: 100
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: "Hz"
+    entity_category: config
+    on_value:
+      then:
+        - script.execute: fan_apply_current_speed
+
+  - platform: template
+    id: fan_middle_freq
+    name: Fan Medium Frequency
+    icon: "mdi:fan-speed-2"
+    min_value: 80
+    max_value: 600
+    step: 10
+    initial_value: 160
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: "Hz"
+    entity_category: config
+    on_value:
+      then:
+        - script.execute: fan_apply_current_speed
+
+  - platform: template
+    id: fan_high_freq
+    name: Fan High Frequency
+    icon: "mdi:fan-speed-3"
+    min_value: 120
+    max_value: 900
+    step: 10
+    initial_value: 240
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: "Hz"
+    entity_category: config
+    on_value:
+      then:
+        - script.execute: fan_apply_current_speed
+
+sensor:
+  # GPIO34: штатный температурный датчик приточного воздуха.
+  # По измерениям напряжение падает при росте температуры.
+  # Датчик используется как температурный вход через калибровочную таблицу.
+  # Сырой канал напряжения оставлен как диагностический сенсор.
+  # attenuation фиксирован на 12db, потому что ESPHome не позволяет использовать attenuation: auto вместе с samples.
+  - platform: adc
+    id: temp_adc_voltage
+    name: ${dev_name}_temperature_adc_voltage
+    internal: true
+    pin: ${temp_adc}
+    attenuation: 12db
+    samples: 16
+    update_interval: 10s
+    accuracy_decimals: 3
+    unit_of_measurement: V
+    entity_category: diagnostic
+    disabled_by_default: true
+    filters:
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 1
+
+  # Основной температурный сенсор.
+  # Сущность публикует текущую температуру приточного воздуха.
+  # Калибровка построена по вашим точкам:
+  # 1.03V=19C, 1.04V=18C, 0.64V=37C, 0.71V=32C,
+  # 0.78V=29C, 0.90V=22C, 0.95V=21C, 0.99V=20C.
+  - platform: template
+    id: supply_air_temperature
+    name: Temperature Current
+    icon: "mdi:thermometer"
+    device_class: temperature
+    state_class: measurement
+    unit_of_measurement: "°C"
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      const float v = id(temp_adc_voltage).state;
+      if (isnan(v) || v <= 0.05f || v >= 3.25f) {
+        return NAN;
+      }
+
+      // Аппроксимация по измеренным точкам напряжения и температуры.
+      // Модель: 1/Tk = A * ln(V / (3.3 - V)) + B
+      // Коэффициенты A и B рассчитаны по калибровочной таблице выше.
+      const float a = 0.0003162728f;
+      const float b = 0.0036822819f;
+      const float vs = 3.3f;
+
+      const float ratio = v / (vs - v);
+      if (ratio <= 0.0f) {
+        return NAN;
+      }
+
+      const float tk = 1.0f / (a * logf(ratio) + b);
+      return tk - 273.15f;
+    on_value:
+      then:
+        - script.execute: heat_temperature_update
+
+  - platform: template
+    id: shutter_position_segments_sensor
+    name: ${dev_name}_shutter_position_segments
+    internal: true
+    icon: "mdi:counter"
+    accuracy_decimals: 0
+    update_interval: 5s
+    entity_category: diagnostic
+    disabled_by_default: true
+    lambda: |-
+      return id(shutter_position_segments);
+
+  - platform: template
+    id: prefilter_runtime_hours_sensor
+    name: Prefilter Runtime
+    icon: "mdi:air-filter"
+    unit_of_measurement: "h"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: 60s
+    lambda: |-
+      return id(prefilter_runtime_seconds) / 3600.0f;
+
+  - platform: template
+    id: main_filter_runtime_hours_sensor
+    name: Main Filter Runtime
+    icon: "mdi:air-filter"
+    unit_of_measurement: "h"
+    accuracy_decimals: 1
+    state_class: measurement
+    update_interval: 60s
+    lambda: |-
+      return id(main_filter_runtime_seconds) / 3600.0f;
+
+  - platform: pulse_width
+    id: mhz19_pwm_high
+    name: ${dev_name}_mhz19_pwm_high_raw
+    internal: true
+    pin: ${mhz19_pwm}
+    update_interval: 10s
+    unit_of_measurement: s
+    entity_category: diagnostic
+
+  - platform: template
+    id: co2_pwm_estimate
+    name: CO₂
+    unit_of_measurement: ppm
+    device_class: carbon_dioxide
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      const float th_ms = id(mhz19_pwm_high).state * 1000.0f;
+      if (isnan(th_ms) || th_ms <= 2.0f) return NAN;
+      return (th_ms - 2.0f) * 5.0f;
+    on_value:
+      then:
+        - script.execute: auto_co2_update
+
+
+light:
+  # Диагностический тест светодиодов панели.
+  # Панель содержит 6 адресных светодиодов, подключённых цепочкой к GPIO17.
+  # Базовая лента и её разделы управляют этими светодиодами.
+  # Параметры chipset и rgb_order заданы для подтверждённой панели.
+  - platform: esp32_rmt_led_strip
+    id: oneair_panel_leds_raw
+    name: ${dev_name}_panel_leds_raw
+    internal: true
+    pin: ${panel_led_data_pin}
+    num_leds: ${panel_led_count}
+    rgb_order: ${panel_led_rgb_order}
+    chipset: ${panel_led_chipset}
+
+  - platform: partition
+    id: oneair_panel_leds_all
+    name: ${dev_name}_panel_leds_all
+    internal: true
+    segments:
+      - id: oneair_panel_leds_raw
+        from: 0
+        to: 5
+    effects:
+      - addressable_color_wipe:
+          name: Panel LED wipe
+          add_led_interval: 300ms
+          reverse: false
+          colors:
+            - red: 100%
+              green: 0%
+              blue: 0%
+              num_leds: 1
+            - red: 0%
+              green: 100%
+              blue: 0%
+              num_leds: 1
+            - red: 0%
+              green: 0%
+              blue: 100%
+              num_leds: 1
+            - red: 100%
+              green: 100%
+              blue: 100%
+              num_leds: 1
+      - addressable_rainbow:
+          name: Panel LED rainbow
+          speed: 10
+          width: 6
+
+  - platform: partition
+    id: oneair_panel_led_1
+    name: ${dev_name}_panel_led_1
+    internal: true
+    segments:
+      - id: oneair_panel_leds_raw
+        from: 0
+        to: 0
+
+  - platform: partition
+    id: oneair_panel_led_2
+    name: ${dev_name}_panel_led_2
+    internal: true
+    segments:
+      - id: oneair_panel_leds_raw
+        from: 1
+        to: 1
+
+  - platform: partition
+    id: oneair_panel_led_3
+    name: ${dev_name}_panel_led_3
+    internal: true
+    segments:
+      - id: oneair_panel_leds_raw
+        from: 2
+        to: 2
+
+  - platform: partition
+    id: oneair_panel_led_4
+    name: ${dev_name}_panel_led_4
+    internal: true
+    segments:
+      - id: oneair_panel_leds_raw
+        from: 3
+        to: 3
+
+  - platform: partition
+    id: oneair_panel_led_5
+    name: ${dev_name}_panel_led_5
+    internal: true
+    segments:
+      - id: oneair_panel_leds_raw
+        from: 4
+        to: 4
+
+  - platform: partition
+    id: oneair_panel_led_6
+    name: ${dev_name}_panel_led_6
+    internal: true
+    segments:
+      - id: oneair_panel_leds_raw
+        from: 5
+        to: 5
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: ${dev_name}_ip
+      internal: true
+      icon: "mdi:lan"
+    ssid:
+      name: ${dev_name}_ssid
+      internal: true
+      icon: "mdi:wifi"
+    mac_address:
+      name: ${dev_name}_mac
+      internal: true
+      icon: "mdi:lan"
+
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(eco_mode_flag) && !isnan(id(supply_air_temperature).state) && id(supply_air_temperature).state < ${eco_min_temperature};
+          then:
+            - logger.log: "Eco: supply-air temperature below +5C, cancelling Eco and closing shutter"
+            - script.execute: device_power_off
+      - script.execute: heat_temperature_update
+
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(fan_running_flag) && id(fan_physical_allowed) && !id(eco_mode_flag);
+          then:
+            - lambda: |-
+                id(prefilter_runtime_seconds) += 60;
+                id(main_filter_runtime_seconds) += 60;
+                id(prefilter_runtime_hours_sensor).publish_state(id(prefilter_runtime_seconds) / 3600.0f);
+                id(main_filter_runtime_hours_sensor).publish_state(id(main_filter_runtime_seconds) / 3600.0f);
+
+binary_sensor:
+  - platform: status
+    name: ${dev_name}_status
+    internal: true
+
+  - platform: gpio
+    id: shutter_closed_sensor
+    name: Shutter Closed
+    icon: "mdi:window-shutter-alert"
+    # GPIO39 меняет состояние при достижении концевика закрытия.
+    # Логический ON означает закрытое положение.
+    pin:
+      number: ${shutter_closed}
+      mode: INPUT
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - script.execute: shutter_closed_endstop_script
+
+  - platform: gpio
+    id: shutter_opened_sensor
+    name: Shutter Opened
+    icon: "mdi:window-shutter-open"
+    # GPIO36 на ESP32 работает только как вход, внутренняя подтяжка не используется.
+    # Сигнал инвертирован: логический ON означает полностью открытую шторку.
+    pin:
+      number: ${shutter_opened}
+      mode: INPUT
+      inverted: true
+    filters:
+      # Быстрое срабатывание останавливает открытие сразу после концевика.
+      - delayed_on: 5ms
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - script.execute: shutter_opened_endstop_script
+
+  - platform: gpio
+    id: touch_speed_sensor
+    name: Speed
+    icon: "mdi:fan"
+    internal: true
+    pin:
+      number: ${touch_speed}
+      mode: INPUT_PULLUP
+      inverted: ${touch_inverted}
+    filters:
+      - delayed_on: 80ms
+      - delayed_off: 80ms
+    # Возвращена стабильная логика из v13i: короткое нажатие обрабатывается сразу,
+    # без on_multi_click и без таймера удержания. Поэтому нет задержки звука и нет ложного выключения.
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: "return id(speed_long_press_ignore_short_flag);"
+            then:
+              - logger.log: "Speed short press skipped after already handled long press"
+              - lambda: "id(speed_long_press_ignore_short_flag) = false;"
+            else:
+              - if:
+                  condition:
+                    lambda: "return id(night_mode).state && !id(night_display_awake_flag);"
+                  then:
+                    - logger.log: "Night mode: Speed touch wakes panel only"
+                    - script.execute: night_panel_wake
+                  else:
+                    - script.execute: touch_speed_short_press
+                    - if:
+                        condition:
+                          switch.is_on: night_mode
+                        then:
+                          - script.execute: night_panel_wake
+
+  - platform: gpio
+    id: touch_heat_sensor
+    name: Heat
+    icon: "mdi:heat-wave"
+    internal: true
+    pin:
+      number: ${touch_heat}
+      mode: INPUT_PULLUP
+      inverted: ${touch_inverted}
+    filters:
+      - delayed_on: 80ms
+      - delayed_off: 80ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: "return id(night_mode).state && !id(night_display_awake_flag);"
+            then:
+              - logger.log: "Night mode: Heat touch wakes panel only"
+              - script.execute: night_panel_wake
+            else:
+              - script.execute: button_beep
+              # Цикл кнопки Heat:
+              # OFF/защита от холода -> цель 20 °C (один жёлтый LED) -> цель 25 °C (два жёлтых LED) -> OFF.
+              - if:
+                  condition:
+                    lambda: "return id(heat_mode_request_level) != 1 && id(heat_mode_request_level) != 2;"
+                  then:
+                    - logger.log: "Heat touch: target 20C"
+                    - script.execute: heat_set_target_20
+                  else:
+                    - if:
+                        condition:
+                          lambda: "return id(heat_mode_request_level) == 1;"
+                        then:
+                          - logger.log: "Heat touch: target 25C"
+                          - script.execute: heat_set_target_25
+                        else:
+                          - logger.log: "Heat touch: HEAT OFF"
+                          - script.execute: heat_manual_off
+              - if:
+                  condition:
+                    switch.is_on: night_mode
+                  then:
+                    - script.execute: night_panel_wake
+
+  - platform: gpio
+    id: touch_night_sensor
+    name: Night
+    icon: "mdi:weather-night"
+    internal: true
+    pin:
+      number: ${touch_night}
+      mode: INPUT_PULLUP
+      inverted: ${touch_inverted}
+    filters:
+      - delayed_on: 80ms
+      - delayed_off: 80ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: "return id(night_long_press_ignore_short_flag);"
+            then:
+              - logger.log: "Night short press skipped after already handled long press"
+              - lambda: "id(night_long_press_ignore_short_flag) = false;"
+            else:
+              - if:
+                  condition:
+                    lambda: "return id(night_mode).state && !id(night_display_awake_flag);"
+                  then:
+                    - logger.log: "Night mode: Night touch wakes panel only"
+                    - script.execute: night_panel_wake
+                  else:
+                    - script.execute: button_beep
+                    - switch.toggle: night_mode
+
+
+
+  # Видимые инвертированные сенсоры кнопок для Home Assistant.
+  # Физические GPIO-сенсоры выше остаются внутренними и сохраняют рабочую логику кнопок.
+  - platform: template
+    id: touch_speed_sensor_visible
+    name: Speed
+    icon: "mdi:fan"
+    lambda: |-
+      return !id(touch_speed_sensor).state;
+
+  # Детектор долгого удержания видимого состояния Speed.
+  # Он не меняет логику короткого нажатия и только выключает устройство,
+  # если Speed находится в состоянии ON больше 3 секунд.
+  - platform: template
+    id: touch_speed_long_press_visible_detector
+    internal: true
+    lambda: |-
+      return id(touch_speed_sensor_visible).state;
+    filters:
+      - delayed_on: 3s
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - logger.log: "Speed visible state ON > 3s: confirmation beep and Device OFF"
+        - lambda: "id(speed_long_press_ignore_short_flag) = true;"
+        - script.execute: long_press_confirm_beep
+        - script.wait: long_press_confirm_beep
+        - script.execute: device_power_off
+
+  - platform: template
+    id: touch_heat_sensor_visible
+    name: Heat
+    icon: "mdi:heat-wave"
+    lambda: |-
+      return !id(touch_heat_sensor).state;
+
+  - platform: template
+    id: touch_night_sensor_visible
+    name: Night
+    icon: "mdi:weather-night"
+    lambda: |-
+      return !id(touch_night_sensor).state;
+
+  # Детектор долгого удержания видимого состояния Night.
+  # Удержание Night в состоянии ON больше 3 секунд включает Eco; событие отпускания игнорируется.
+  - platform: template
+    id: touch_night_long_press_visible_detector
+    internal: true
+    lambda: |-
+      return id(touch_night_sensor_visible).state;
+    filters:
+      - delayed_on: 3s
+      - delayed_off: 50ms
+    on_press:
+      then:
+        - logger.log: "Night visible state ON > 3s: confirmation beep and Eco preset ON"
+        - lambda: "id(night_long_press_ignore_short_flag) = true;"
+        - script.execute: long_press_confirm_beep
+        - script.wait: long_press_confirm_beep
+        - script.execute: eco_mode_on
+
+cover:
+  - platform: template
+    id: shutter_cover
+    name: Shutter
+    device_class: shutter
+    has_position: true
+    optimistic: false
+    assumed_state: false
+    lambda: |-
+      // Cover использует дискретные положения интерфейса:
+      // 0% = 0 сегментов, 25% = 1 сегмент, 75% = 2 сегмента, 100% = 3 сегмента.
+      if (id(shutter_closed_sensor).state) {
+        return 0.0f;
+      }
+      if (id(shutter_opened_sensor).state) {
+        return 1.0f;
+      }
+      if (id(shutter_position_segments) <= 0) return 0.0f;
+      if (id(shutter_position_segments) == 1) return 0.25f;
+      if (id(shutter_position_segments) == 2) return 0.75f;
+      return 1.0f;
+    open_action:
+      - script.execute: shutter_move_to_segment_3_script
+    close_action:
+      - script.execute: shutter_move_to_segment_0_script
+    stop_action:
+      - script.execute: shutter_stop_script
+    position_action:
+      - lambda: |-
+          int target_segment = 0;
+          if (pos <= 0.125f) {
+            target_segment = 0;
+          } else if (pos <= 0.50f) {
+            target_segment = 1;
+          } else if (pos <= 0.875f) {
+            target_segment = 2;
+          } else {
+            target_segment = 3;
+          }
+          ESP_LOGD("oneair", "Cover position request: %.0f%% -> target segment %d", pos * 100.0f, target_segment);
+      - if:
+          condition:
+            lambda: "return pos <= 0.125f;"
+          then:
+            - script.execute: shutter_move_to_segment_0_script
+          else:
+            - if:
+                condition:
+                  lambda: "return pos <= 0.50f;"
+                then:
+                  - script.execute: shutter_move_to_segment_1_script
+                else:
+                  - if:
+                      condition:
+                        lambda: "return pos <= 0.875f;"
+                      then:
+                        - script.execute: shutter_move_to_segment_2_script
+                      else:
+                        - script.execute: shutter_move_to_segment_3_script
+
+
+climate:
+  - platform: ballu_oneair_climate
+    id: oneair_climate
+    name: ONEAIR Climate
+    sensor: supply_air_temperature
+    visual:
+      min_temperature: 5
+      max_temperature: 25
+      temperature_step:
+        target_temperature: 1
+        current_temperature: 0.1
+    # Соответствия:
+    # - mode OFF      -> выключено, вентилятор/нагрев OFF, шторка закрыта
+    # - mode FAN_ONLY -> вентиляция
+    # - mode HEAT     -> обогрев
+    # - стандартный preset Eco -> пассивное проветривание: шторка открыта, вентилятор и нагрев выключены
+    # - целевая температура 5–25 °C управляет нагревом в режиме HEAT
+    # - стандартные режимы вентилятора Auto/Low/Medium/High -> авто CO₂ и основные скорости
+    # - пользовательские режимы вентилятора Quiet/Turbo -> дополнительные скорости
+    # - swing OFF/HORIZONTAL/VERTICAL/BOTH -> шторка 0/25/75/100%
+    on_control:
+      # Стандартный preset Eco.
+      - if:
+          condition:
+            lambda: |-
+              return x.get_preset().has_value() && *x.get_preset() == climate::CLIMATE_PRESET_ECO;
+          then:
+            - logger.log: "Climate: Eco preset requested"
+            - script.execute: eco_mode_on
+            - lambda: 'id(oneair_climate).publish_eco_state();'
+
+      # Режим OFF обрабатывается сразу.
+      - if:
+          condition:
+            lambda: |-
+              return x.get_mode().has_value() && *x.get_mode() == climate::CLIMATE_MODE_OFF;
+          then:
+            - logger.log: "Climate: OFF requested"
+            - script.execute: device_power_off
+            - lambda: 'id(oneair_climate).publish_off_state();'
+
+      # Целевая температура 5–25 °C для режима HEAT.
+      - if:
+          condition:
+            lambda: |-
+              return x.get_target_temperature().has_value();
+          then:
+            - lambda: |-
+                float t = *x.get_target_temperature();
+                if (isnan(t)) t = ${heat_default_target};
+                if (t < ${heat_min_temperature}) t = ${heat_min_temperature};
+                if (t > ${heat_boost_target}) t = ${heat_boost_target};
+                id(heat_target_temperature) = t;
+                id(oneair_climate).target_temperature = t;
+                if (id(oneair_climate).mode == climate::CLIMATE_MODE_HEAT || id(heat_mode_request_level) > 0) {
+                  id(heat_cold_protect_flag) = false;
+                  id(heat_mode_request_level) = (t >= 22.5f) ? 2 : 1;
+                }
+                ESP_LOGD("oneair", "Climate target temperature requested: %.1fC", t);
+            - script.execute: heat_led_update
+            - script.execute: heat_control_update
+
+      # Соответствие swing и положения шторки.
+      # Обработка выполняется до команд режима. Для отдельной команды swing не запускаются обработчики FAN_ONLY/HEAT,
+      # чтобы изменение положения шторки не запускало полное открытие.
+      - if:
+          condition:
+            lambda: |-
+              return x.get_swing_mode().has_value() && *x.get_swing_mode() == climate::CLIMATE_SWING_OFF;
+          then:
+            - logger.log: "Climate swing: OFF -> shutter closed"
+            - script.execute: shutter_move_to_segment_0_script
+            - lambda: 'id(oneair_climate).publish_swing_segment(0);'
+      - if:
+          condition:
+            lambda: |-
+              return x.get_swing_mode().has_value() && *x.get_swing_mode() == climate::CLIMATE_SWING_HORIZONTAL;
+          then:
+            - logger.log: "Climate swing HORIZONTAL: положение шторки 25 процентов"
+            - script.execute: shutter_move_to_segment_1_script
+            - lambda: 'id(oneair_climate).publish_swing_segment(1);'
+      - if:
+          condition:
+            lambda: |-
+              return x.get_swing_mode().has_value() && *x.get_swing_mode() == climate::CLIMATE_SWING_VERTICAL;
+          then:
+            - logger.log: "Climate swing VERTICAL: положение шторки 75 процентов"
+            - script.execute: shutter_move_to_segment_2_script
+            - lambda: 'id(oneair_climate).publish_swing_segment(2);'
+      - if:
+          condition:
+            lambda: |-
+              return x.get_swing_mode().has_value() && *x.get_swing_mode() == climate::CLIMATE_SWING_BOTH;
+          then:
+            - logger.log: "Climate swing BOTH: шторка полностью открыта"
+            - script.execute: shutter_move_to_segment_3_script
+            - lambda: 'id(oneair_climate).publish_swing_segment(3);'
+
+      # Режим Auto: MH-Z19 CO₂ управляет скоростью, LED скорости и LED качества воздуха возле Night.
+      - if:
+          condition:
+            lambda: |-
+              return x.get_fan_mode().has_value() && *x.get_fan_mode() == climate::CLIMATE_FAN_AUTO;
+          then:
+            - logger.log: "Climate: fan mode Auto by CO2"
+            - script.execute: eco_mode_off
+            - script.execute: auto_mode_on
+
+      # Режимы вентилятора: стандартные Low/Medium/High и пользовательские Quiet/Turbo.
+      # Quiet обрабатывается в двух вариантах: как пользовательский режим вентилятора
+      # и как стандартный CLIMATE_FAN_QUIET.
+      - if:
+          condition:
+            lambda: |-
+              if (x.get_fan_mode().has_value() && *x.get_fan_mode() == climate::CLIMATE_FAN_QUIET) return true;
+              if (!x.has_custom_fan_mode()) return false;
+              auto m = x.get_custom_fan_mode();
+              return m == "Quiet" || m == "quiet" || m == "QUIET";
+          then:
+            - logger.log: "Climate: fan mode Quiet"
+            - script.execute: auto_mode_off
+            - script.execute: eco_mode_off
+            - if:
+                condition:
+                  lambda: "return id(oneair_climate).mode == climate::CLIMATE_MODE_HEAT || id(heat_mode_request_level) > 0;"
+                then:
+                  - logger.log: "Climate Quiet ignored in HEAT: using LOW for heater safety"
+                  - fan.turn_on:
+                      id: fan_output
+                      speed: 2
+                  - lambda: 'id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_LOW);'
+                  - script.execute: heat_control_update
+                else:
+                  - fan.turn_on:
+                      id: fan_output
+                      speed: 1
+                  - lambda: 'id(oneair_climate).publish_fan_only_state("Quiet");'
+            - script.execute: speed_led_update_from_current_state
+
+      - if:
+          condition:
+            lambda: |-
+              return x.get_fan_mode().has_value() && *x.get_fan_mode() == climate::CLIMATE_FAN_LOW;
+          then:
+            - logger.log: "Climate: fan mode Low"
+            - script.execute: auto_mode_off
+            - script.execute: eco_mode_off
+            - fan.turn_on:
+                id: fan_output
+                speed: 2
+            - lambda: |-
+                if (id(oneair_climate).mode == climate::CLIMATE_MODE_HEAT) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_LOW);
+                else id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_LOW);
+            - script.execute: speed_led_update_from_current_state
+
+      - if:
+          condition:
+            lambda: |-
+              return x.get_fan_mode().has_value() && (*x.get_fan_mode() == climate::CLIMATE_FAN_MEDIUM || *x.get_fan_mode() == climate::CLIMATE_FAN_MIDDLE);
+          then:
+            - logger.log: "Climate: fan mode Middle"
+            - script.execute: auto_mode_off
+            - script.execute: eco_mode_off
+            - fan.turn_on:
+                id: fan_output
+                speed: 3
+            - lambda: |-
+                if (id(oneair_climate).mode == climate::CLIMATE_MODE_HEAT) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_MEDIUM);
+                else id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_MEDIUM);
+            - script.execute: speed_led_update_from_current_state
+
+      - if:
+          condition:
+            lambda: |-
+              return x.get_fan_mode().has_value() && *x.get_fan_mode() == climate::CLIMATE_FAN_HIGH;
+          then:
+            - logger.log: "Climate: fan mode High"
+            - script.execute: auto_mode_off
+            - script.execute: eco_mode_off
+            - fan.turn_on:
+                id: fan_output
+                speed: 4
+            - lambda: |-
+                if (id(oneair_climate).mode == climate::CLIMATE_MODE_HEAT) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_HIGH);
+                else id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_HIGH);
+            - script.execute: speed_led_update_from_current_state
+
+      - if:
+          condition:
+            lambda: |-
+              if (!x.has_custom_fan_mode()) return false;
+              auto m = x.get_custom_fan_mode();
+              return m == "Turbo" || m == "turbo" || m == "TURBO";
+          then:
+            - logger.log: "Climate: fan mode Turbo"
+            - script.execute: auto_mode_off
+            - script.execute: eco_mode_off
+            - fan.turn_on:
+                id: fan_output
+                speed: 5
+            - lambda: |-
+                if (id(oneair_climate).mode == climate::CLIMATE_MODE_HEAT) id(oneair_climate).publish_heat_state("Turbo");
+                else id(oneair_climate).publish_fan_only_state("Turbo");
+            - script.execute: speed_led_update_from_current_state
+
+      # Режим FAN_ONLY запускается только для отдельной команды режима, без совмещённых fan/swing/preset.
+      - if:
+          condition:
+            lambda: |-
+              if (!x.get_mode().has_value() || *x.get_mode() != climate::CLIMATE_MODE_FAN_ONLY) return false;
+              if (x.get_swing_mode().has_value() || x.get_fan_mode().has_value() || x.has_custom_fan_mode() || x.get_preset().has_value() || x.has_custom_preset()) return false;
+              return true;
+          then:
+            - logger.log: "Climate: FAN_ONLY requested"
+            - script.execute: auto_mode_off
+            - script.execute: eco_mode_off
+            - lambda: |-
+                id(heat_mode_request_level) = 0;
+                id(heat_cold_protect_flag) = false;
+            - script.execute: heater_all_off
+            - script.execute: heat_led_update
+            - script.execute: device_power_on
+            - script.execute: climate_publish_from_current_state
+
+      # Режим HEAT запускается только для отдельной команды режима, без совмещённых fan/swing/preset.
+      - if:
+          condition:
+            lambda: |-
+              if (!x.get_mode().has_value() || *x.get_mode() != climate::CLIMATE_MODE_HEAT) return false;
+              if (x.get_swing_mode().has_value() || x.get_fan_mode().has_value() || x.has_custom_fan_mode() || x.get_preset().has_value() || x.has_custom_preset()) return false;
+              return true;
+          then:
+            - logger.log: "Climate: HEAT requested"
+            - script.execute: auto_mode_off
+            - script.execute: eco_mode_off
+            - script.execute: heat_from_climate_request
+
+fan:
+  - platform: speed
+    id: fan_output
+    name: ${dev_name}_fan
+    internal: true
+    output: fan_speed_output
+    speed_count: 5
+    restore_mode: ALWAYS_OFF
+    preset_modes:
+      - Eco
+      - Quiet
+      - Low
+      - Middle
+      - High
+      - Turbo
+    on_preset_set:
+      - if:
+          condition:
+            lambda: 'return id(fan_output).get_preset_mode() == "Eco";'
+          then:
+            - script.execute: eco_mode_on
+          else:
+            - script.execute: auto_mode_off
+            - script.execute: eco_mode_off
+            - lambda: |-
+                auto preset = id(fan_output).get_preset_mode();
+                auto call = id(fan_output).turn_on();
+                if (preset == "Quiet") {
+                  call.set_speed(1);
+                } else if (preset == "Low") {
+                  call.set_speed(2);
+                } else if (preset == "Middle") {
+                  call.set_speed(3);
+                } else if (preset == "High") {
+                  call.set_speed(4);
+                } else if (preset == "Turbo") {
+                  call.set_speed(5);
+                }
+                call.perform();
+    on_turn_on:
+      - if:
+          condition:
+            lambda: 'return id(fan_output).get_preset_mode() == "Eco";'
+          then:
+            - script.execute: eco_mode_on
+          else:
+            - lambda: |-
+                id(power_on_flag) = true;
+                id(eco_mode_flag) = false;
+            - script.stop: eco_led_animation
+            - if:
+                condition:
+                  lambda: "return !id(shutter_opened_sensor).state && !id(fan_physical_allowed);"
+                then:
+                  - logger.log: "Fan turned on: opening shutter before physical fan start"
+                  - script.execute: active_fan_start_after_shutter
+    on_turn_off:
+      - if:
+          condition:
+            lambda: "return id(device_power_off_in_progress_flag);"
+          then:
+            - logger.log: "Fan entity OFF during device shutdown/cooldown: callback skipped"
+          else:
+            - logger.log: "Fan entity OFF requested: run device power-off sequence"
+            - script.execute: device_power_off
+
+script:
+  - id: touch_speed_short_press
+    mode: restart
+    then:
+      - script.execute: button_beep
+      - if:
+          condition:
+            lambda: "return id(eco_mode_flag) || !id(fan_running_flag) || id(fan_output).state == false;"
+          then:
+            - logger.log: "Speed short press: active ventilation ON"
+            - script.execute: device_power_on
+          else:
+            - logger.log: "Speed short press: cycle fan speed"
+            # Физическое нажатие Speed является ручным управлением.
+            # Если Auto активен, он отключается перед публикацией новой ручной скорости.
+            - if:
+                condition:
+                  lambda: "return id(auto_mode_flag);"
+                then:
+                  - logger.log: "Speed short press: manual override, Auto fan mode OFF"
+                  - lambda: |-
+                      id(auto_mode_flag) = false;
+                  - script.stop: co2_alarm_blink
+                  - if:
+                      condition:
+                        switch.is_on: night_mode
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_1
+                            brightness: 35%
+                            red: 0%
+                            green: 0%
+                            blue: 100%
+                            transition_length: 150ms
+                      else:
+                        - light.turn_off:
+                            id: oneair_panel_led_1
+                            transition_length: 150ms
+            - lambda: |-
+                auto call = id(fan_output).turn_on();
+                int next_speed = id(fan_output).speed + 1;
+                if (next_speed > 5) {
+                  next_speed = 1;
+                }
+                call.set_speed(next_speed);
+                call.perform();
+            - script.execute: climate_publish_from_current_state
+
+  # Внутренний запуск активной вентиляции. Отдельной сущности power больше нет:
+  # используется штатный переключатель oneair_fan.
+  - id: device_power_on
+    mode: restart
+    then:
+      - logger.log: "Активная вентиляция: Auto/Eco выключены, шторка открывается полностью, затем запускается сохранённая скорость вентилятора"
+      - script.execute: auto_mode_off
+      - lambda: |-
+          int sp = id(fan_target_speed);
+          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+          if (sp < 1 || sp > 5) sp = 2;
+          if (id(heat_mode_request_level) > 0 && sp == 1) sp = 2;
+          id(pending_fan_speed) = sp;
+          id(fan_target_speed) = sp;
+          id(power_on_flag) = true;
+          id(eco_mode_flag) = false;
+          id(heat_mode_request_level) = 0;
+          id(heat_cold_protect_flag) = false;
+          if (sp == 1) {
+            id(oneair_climate).publish_fan_only_state("Quiet");
+          } else if (sp == 2) {
+            id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_LOW);
+          } else if (sp == 3) {
+            id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_MEDIUM);
+          } else if (sp == 4) {
+            id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_HIGH);
+          } else {
+            id(oneair_climate).publish_fan_only_state("Turbo");
+          }
+      - script.stop: eco_led_animation
+      - light.turn_off: oneair_panel_leds_all
+      - script.execute: speed_led_update_from_current_state
+      - script.execute: heater_all_off
+      - script.execute: heat_led_update
+      - script.execute: active_fan_start_after_shutter
+
+  - id: device_power_off
+    mode: restart
+    then:
+      - logger.log: "Device OFF requested"
+      - lambda: |-
+          id(device_power_off_in_progress_flag) = true;
+          // Безопасная продувка выполняется, если был активен режим обогрева или включён нагревательный выход
+          // в момент выключения бризера пользователем.
+          id(heat_shutdown_cooldown_needed_flag) = id(heat_mode_request_level) > 0 || id(heater_stage_1_flag) || id(heater_stage_2_flag);
+          id(oneair_climate).publish_off_state();
+      - script.stop: eco_led_animation
+      - script.stop: co2_alarm_blink
+      - script.execute: heater_all_off
+      - script.execute: heat_led_update
+      - if:
+          condition:
+            lambda: "return id(heat_shutdown_cooldown_needed_flag);"
+          then:
+            - logger.log: "Device OFF from HEAT: heater OFF, fan HIGH cooldown for 60 seconds, then close shutter"
+            - lambda: |-
+                id(power_on_flag) = true;
+                id(eco_mode_flag) = false;
+                id(auto_mode_flag) = false;
+                id(fan_starting_sequence_flag) = false;
+                id(fan_physical_allowed) = true;
+                id(heat_mode_request_level) = 0;
+                id(heat_cold_protect_flag) = false;
+                id(pending_fan_speed) = 4;
+                id(fan_target_speed) = 4;
+            - light.turn_off:
+                id: oneair_panel_led_2
+                transition_length: 150ms
+            - light.turn_off:
+                id: oneair_panel_led_3
+                transition_length: 150ms
+            - fan.turn_on:
+                id: fan_output
+                speed: 4
+            - script.execute: speed_led_update_from_current_state
+            - delay: ${heat_shutdown_cooldown_delay}
+            - logger.log: "Heat cooldown complete: fan OFF and shutter CLOSE"
+            - lambda: |-
+                id(power_on_flag) = false;
+                id(eco_mode_flag) = false;
+                id(auto_mode_flag) = false;
+                id(fan_physical_allowed) = false;
+                id(fan_starting_sequence_flag) = false;
+                id(heat_mode_request_level) = 0;
+                id(heat_cold_protect_flag) = false;
+            - fan.turn_off: fan_output
+            - script.execute: fan_all_off
+            - script.execute: speed_led_update_from_current_state
+            - light.turn_off: oneair_panel_leds_all
+            - script.execute: shutter_move_to_segment_0_script
+          else:
+            - logger.log: "Device OFF without heat cooldown: fan OFF and shutter CLOSE"
+            - lambda: |-
+                id(power_on_flag) = false;
+                id(eco_mode_flag) = false;
+                id(auto_mode_flag) = false;
+                id(fan_physical_allowed) = false;
+                id(fan_starting_sequence_flag) = false;
+                id(heat_mode_request_level) = 0;
+                id(heat_cold_protect_flag) = false;
+            - light.turn_off: oneair_panel_leds_all
+            - fan.turn_off: fan_output
+            - script.execute: fan_all_off
+            - script.execute: shutter_move_to_segment_0_script
+      - lambda: |-
+          id(device_power_off_in_progress_flag) = false;
+          id(heat_shutdown_cooldown_needed_flag) = false;
+
+  # Eco теперь является preset_mode у oneair_fan, а не отдельной сущностью.
+  - id: eco_mode_on
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: |-
+              const float t = id(supply_air_temperature).state;
+              return !isnan(t) && t >= ${eco_min_temperature};
+          then:
+            - logger.log: "Eco preset ON: passive ventilation requested"
+            - lambda: 'id(oneair_climate).publish_eco_state();'
+            - script.stop: eco_led_animation
+            - script.stop: co2_alarm_blink
+            - if:
+                condition:
+                  lambda: |-
+                    // Если Eco включается при активном или недавно включённом нагреве,
+                    // поток воздуха не останавливается сразу. Сначала PTC охлаждается обдувом High.
+                    return id(heat_mode_request_level) > 0 || id(heater_stage_1_flag) || id(heater_stage_2_flag);
+                then:
+                  - logger.log: "Eco from HEAT: heater OFF, fan HIGH cooldown for 60 seconds, then passive Eco"
+                  - lambda: |-
+                      id(power_on_flag) = true;
+                      id(eco_mode_flag) = false;
+                      id(auto_mode_flag) = false;
+                      id(fan_physical_allowed) = true;
+                      id(fan_starting_sequence_flag) = false;
+                      id(heat_mode_request_level) = 0;
+                      id(heat_cold_protect_flag) = false;
+                      id(pending_fan_speed) = 4;
+                      id(fan_target_speed) = 4;
+                  - script.execute: heater_all_off
+                  - script.execute: heat_led_update
+                  - fan.turn_on:
+                      id: fan_output
+                      speed: 4
+                  - script.execute: speed_led_update_from_current_state
+                  - delay: ${heat_shutdown_cooldown_delay}
+                  - logger.log: "Eco heat cooldown complete: fan OFF, shutter remains OPEN"
+            - logger.log: "Eco preset ON: passive ventilation, fan/heater OFF, shutter OPEN"
+            - lambda: |-
+                id(power_on_flag) = true;
+                id(eco_mode_flag) = true;
+                id(auto_mode_flag) = false;
+                id(fan_physical_allowed) = false;
+                id(fan_starting_sequence_flag) = false;
+                id(heat_mode_request_level) = 0;
+                id(heat_cold_protect_flag) = false;
+            - script.execute: heater_all_off
+            - script.execute: heat_led_update
+            - script.execute: fan_physical_off
+            - script.execute: shutter_move_to_segment_3_script
+            - script.execute: eco_led_animation
+          else:
+            - logger.log: "Eco blocked: supply-air temperature is below +5C or unknown; shutter will close"
+            - script.execute: device_power_off
+
+  - id: eco_mode_off
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(eco_mode_flag);"
+          then:
+            - logger.log: "Eco preset OFF"
+      - lambda: |-
+          id(eco_mode_flag) = false;
+      - script.stop: eco_led_animation
+      # Здесь не выключаются все светодиоды панели. Этот скрипт выполняется асинхронно;
+      # при выборе ручной скорости из HA он не должен гасить LED скорости
+      # после выполнения speed_led_update_from_current_state.
+      - script.execute: heat_led_update
+
+  - id: auto_mode_on
+    mode: restart
+    then:
+      - logger.log: "Auto fan mode ON: CO2 ppm controls fan speed"
+      - lambda: |-
+          id(auto_mode_flag) = true;
+          id(eco_mode_flag) = false;
+          id(power_on_flag) = true;
+          // Активный режим обогрева сохраняется. Без обогрева Auto работает как вентиляция.
+          if (id(oneair_climate).mode == climate::CLIMATE_MODE_HEAT || id(heat_mode_request_level) > 0) {
+            id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_AUTO);
+          } else {
+            id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_AUTO);
+          }
+      - script.stop: eco_led_animation
+      - script.execute: auto_co2_update
+
+  - id: auto_mode_off
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(auto_mode_flag);"
+          then:
+            - logger.log: "Auto fan mode OFF"
+      - lambda: |-
+          id(auto_mode_flag) = false;
+      - script.stop: co2_alarm_blink
+      # Восстановление обычной индикации Night после освобождения LED1 режимом Auto.
+      - if:
+          condition:
+            switch.is_on: night_mode
+          then:
+            - if:
+                condition:
+                  lambda: "return id(night_display_awake_flag);"
+                then:
+                  - light.turn_on:
+                      id: oneair_panel_led_1
+                      brightness: ${night_led_awake_brightness}
+                      red: 0%
+                      green: 0%
+                      blue: 100%
+                      transition_length: 150ms
+                else:
+                  - script.execute: night_panel_dim
+          else:
+            - light.turn_off:
+                id: oneair_panel_led_1
+                transition_length: 150ms
+
+  - id: heat_set_target_20
+    mode: restart
+    then:
+      - script.execute: eco_mode_off
+      - lambda: |-
+          id(heat_cold_protect_flag) = false;
+          id(heat_mode_request_level) = 1;
+          id(heat_target_temperature) = ${heat_default_target};
+          id(oneair_climate).target_temperature = ${heat_default_target};
+          int sp = id(fan_target_speed);
+          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+          if (sp < 1 || sp > 5) sp = 2;
+          if (sp == 1) {
+            sp = 2;
+            id(fan_target_speed) = 2;
+            id(pending_fan_speed) = 2;
+          }
+          if (sp == 2) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_LOW);
+          else if (sp == 3) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_MEDIUM);
+          else if (sp == 4) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_HIGH);
+          else id(oneair_climate).publish_heat_state("Turbo");
+      - script.execute: heat_led_update
+      - script.execute: heat_control_update
+
+  - id: heat_set_target_25
+    mode: restart
+    then:
+      - script.execute: eco_mode_off
+      - lambda: |-
+          id(heat_cold_protect_flag) = false;
+          id(heat_mode_request_level) = 2;
+          id(heat_target_temperature) = ${heat_boost_target};
+          id(oneair_climate).target_temperature = ${heat_boost_target};
+          int sp = id(fan_target_speed);
+          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+          if (sp < 1 || sp > 5) sp = 2;
+          if (sp == 1) {
+            sp = 2;
+            id(fan_target_speed) = 2;
+            id(pending_fan_speed) = 2;
+          }
+          if (sp == 2) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_LOW);
+          else if (sp == 3) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_MEDIUM);
+          else if (sp == 4) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_HIGH);
+          else id(oneair_climate).publish_heat_state("Turbo");
+      - script.execute: heat_led_update
+      - script.execute: heat_control_update
+
+  - id: heat_from_climate_request
+    mode: restart
+    then:
+      - script.execute: eco_mode_off
+      - lambda: |-
+          float t = id(oneair_climate).target_temperature;
+          if (isnan(t)) t = id(heat_target_temperature);
+          if (isnan(t)) t = ${heat_default_target};
+          if (t < ${heat_min_temperature}) t = ${heat_min_temperature};
+          if (t > ${heat_boost_target}) t = ${heat_boost_target};
+          id(heat_target_temperature) = t;
+          id(oneair_climate).target_temperature = t;
+          id(heat_cold_protect_flag) = false;
+          id(heat_mode_request_level) = (t >= 22.5f) ? 2 : 1;
+          int sp = id(fan_target_speed);
+          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+          if (sp < 1 || sp > 5) sp = 2;
+          if (sp == 1) {
+            sp = 2;
+            id(fan_target_speed) = 2;
+            id(pending_fan_speed) = 2;
+          }
+          if (sp == 2) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_LOW);
+          else if (sp == 3) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_MEDIUM);
+          else if (sp == 4) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_HIGH);
+          else id(oneair_climate).publish_heat_state("Turbo");
+      - script.execute: heat_led_update
+      - script.execute: heat_control_update
+
+  - id: heat_manual_off
+    mode: restart
+    then:
+      - lambda: |-
+          id(heat_mode_request_level) = 0;
+          id(heat_cold_protect_flag) = false;
+      - script.execute: heater_all_off
+      - script.execute: heat_led_update
+      - script.execute: climate_publish_from_current_state
+
+  - id: heat_temperature_update
+    mode: restart
+    then:
+      # Автоматическая защита от холода работает только при активном бризере, не в Eco и не в OFF.
+      - if:
+          condition:
+            lambda: |-
+              const float t = id(supply_air_temperature).state;
+              return id(power_on_flag) && !id(eco_mode_flag) && id(heat_mode_request_level) == 0 && !isnan(t) && t < ${heat_min_temperature};
+          then:
+            - logger.log: "Heat cold protection: supply air below +5C, target +5C"
+            - lambda: |-
+                id(heat_cold_protect_flag) = true;
+                id(heat_mode_request_level) = 3;
+                id(heat_target_temperature) = ${heat_min_temperature};
+                id(oneair_climate).target_temperature = ${heat_min_temperature};
+                id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_LOW);
+            - script.execute: heat_led_update
+            - script.execute: heat_control_update
+      - if:
+          condition:
+            lambda: |-
+              const float t = id(supply_air_temperature).state;
+              return id(heat_cold_protect_flag) && !isnan(t) && t >= (${heat_min_temperature} + 0.5f);
+          then:
+            - logger.log: "Heat cold protection: supply air reached +5C, heating OFF"
+            - lambda: |-
+                id(heat_cold_protect_flag) = false;
+                id(heat_mode_request_level) = 0;
+            - script.execute: heater_all_off
+            - script.execute: heat_led_update
+            - script.execute: climate_publish_from_current_state
+      - if:
+          condition:
+            lambda: "return id(heat_mode_request_level) > 0;"
+          then:
+            - script.execute: heat_control_update
+
+  - id: heat_control_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(heat_mode_request_level) <= 0 || id(eco_mode_flag);"
+          then:
+            - script.execute: heater_all_off
+            - script.execute: heat_led_update
+          else:
+            # Безопасность нагрева: вентилятор должен работать минимум на Low. Quiet при нагреве запрещён.
+            - if:
+                condition:
+                  lambda: "return !id(fan_output).state || !id(fan_running_flag);"
+                then:
+                  - logger.log: "Heat control: fan is OFF, starting LOW before heater"
+                  - fan.turn_on:
+                      id: fan_output
+                      speed: 2
+                  - delay: ${heater_start_delay}
+            - if:
+                condition:
+                  lambda: "return id(fan_target_speed) == 1 || id(fan_output).speed == 1;"
+                then:
+                  - logger.log: "Heat control: Quiet is unsafe with heater, switching fan to LOW"
+                  - fan.turn_on:
+                      id: fan_output
+                      speed: 2
+                  - delay: 1000ms
+            - if:
+                condition:
+                  lambda: |-
+                    const float t = id(supply_air_temperature).state;
+                    return !isnan(t) && t >= (id(heat_target_temperature) + ${heat_hysteresis});
+                then:
+                  - logger.log: "Heat control: target reached, heater outputs OFF but heat mode remains active"
+                  - script.execute: heater_all_off
+                  - script.execute: heat_led_update
+                  - script.execute: climate_publish_from_current_state
+                else:
+                  - if:
+                      condition:
+                        lambda: |-
+                          const float t = id(supply_air_temperature).state;
+                          if (isnan(t)) return true;
+                          return t < (id(heat_target_temperature) - ${heat_hysteresis});
+                      then:
+                        # Переход на High выполняется только если Low не поднимает температуру приточного воздуха.
+                        - if:
+                            condition:
+                              lambda: |-
+                                const float t = id(supply_air_temperature).state;
+                                if (isnan(t)) return false;
+                                if (!(id(heater_stage_1_flag) && !id(heater_stage_2_flag))) return false;
+                                const uint32_t elapsed = millis() - id(heat_low_started_ms);
+                                const float rise = t - id(heat_low_start_temperature);
+                                return elapsed >= ${heat_high_delay_ms} && rise < ${heat_high_min_rise} && t < (id(heat_target_temperature) - ${heat_hysteresis});
+                            then:
+                              - logger.log: "Heat control: Low did not reach target, switching to HIGH"
+                              - lambda: "id(heat_high_escalated_flag) = true;"
+                              - script.execute: heater_high_on
+                              - script.execute: heat_led_update
+                            else:
+                              - if:
+                                  condition:
+                                    lambda: "return !id(heater_stage_1_flag) && !id(heater_stage_2_flag);"
+                                  then:
+                                    - logger.log: "Heat control: using LOW heater stage first"
+                                    - lambda: |-
+                                        id(heat_low_started_ms) = millis();
+                                        id(heat_low_start_temperature) = id(supply_air_temperature).state;
+                                        id(heat_high_escalated_flag) = false;
+                                    - script.execute: heater_low_on
+                                    - script.execute: heat_led_update
+                                  else:
+                                    - script.execute: heat_led_update
+                  - script.execute: climate_publish_from_current_state
+
+  - id: heat_led_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(heat_mode_request_level) <= 0 || (id(night_mode).state && !id(night_display_awake_flag));"
+          then:
+            - light.turn_off:
+                id: oneair_panel_led_2
+                transition_length: 150ms
+            - light.turn_off:
+                id: oneair_panel_led_3
+                transition_length: 150ms
+          else:
+            - if:
+                condition:
+                  lambda: "return id(heat_cold_protect_flag) || id(heat_mode_request_level) == 3;"
+                then:
+                  - light.turn_on:
+                      id: oneair_panel_led_2
+                      brightness: ${heat_led_brightness}
+                      red: 0%
+                      green: 15%
+                      blue: 100%
+                      transition_length: 150ms
+                  - light.turn_on:
+                      id: oneair_panel_led_3
+                      brightness: ${heat_led_brightness}
+                      red: 0%
+                      green: 15%
+                      blue: 100%
+                      transition_length: 150ms
+                else:
+                  - if:
+                      condition:
+                        lambda: "return id(heat_mode_request_level) == 1;"
+                      then:
+                        # LED нагрева расположены зеркально относительно LED скорости:
+                        # первый уровень нагрева включает сегмент со стороны кнопки Heat.
+                        - light.turn_off:
+                            id: oneair_panel_led_2
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_3
+                            brightness: ${heat_led_brightness}
+                            red: 100%
+                            green: 80%
+                            blue: 0%
+                            transition_length: 150ms
+                      else:
+                        - light.turn_on:
+                            id: oneair_panel_led_2
+                            brightness: ${heat_led_brightness}
+                            red: 100%
+                            green: 80%
+                            blue: 0%
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_3
+                            brightness: ${heat_led_brightness}
+                            red: 100%
+                            green: 80%
+                            blue: 0%
+                            transition_length: 150ms
+
+  - id: auto_co2_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(auto_mode_flag);"
+          then:
+            - lambda: |-
+                const float ppm = id(co2_pwm_estimate).state;
+                int speed = 1;  // Резервная скорость Quiet.
+
+                // Ночной режим без PTC-нагревателя: приточный воздух ниже +5 °C отключает вентиляцию.
+                if (id(night_mode).state && !(${ptc_heater_installed})) {
+                  const float t = id(supply_air_temperature).state;
+                  if (isnan(t) || t < ${heat_min_temperature}) {
+                    id(auto_effective_speed) = 0;
+                    id(pending_fan_speed) = 0;
+                    id(fan_target_speed) = 0;
+                    ESP_LOGW("oneair", "Night mode without PTC: supply air below +5C/unknown, device will turn OFF");
+                    return;
+                  }
+                }
+
+                if (!isnan(ppm)) {
+                  if (ppm < 800.0f) {
+                    speed = 1;  // Quiet для диапазонов <500 и 500–800.
+                  } else if (ppm < 1200.0f) {
+                    speed = 2;  // Low.
+                  } else if (ppm < 1600.0f) {
+                    speed = 3;  // Medium.
+                  } else if (ppm < 1800.0f) {
+                    speed = 4;  // High.
+                  } else {
+                    speed = 5;  // Turbo.
+                  }
+                }
+
+                // В ночном режиме CO₂ Auto ограничен диапазоном Quiet..Medium.
+                if (id(night_mode).state && speed > 3) {
+                  speed = 3;
+                }
+
+                if (id(heat_mode_request_level) > 0 && speed == 1) {
+                  speed = 2;  // безопасность нагрева: Quiet не используется при запросе обогрева.
+                }
+                id(auto_effective_speed) = speed;
+                id(pending_fan_speed) = speed;
+                id(fan_target_speed) = speed;
+                ESP_LOGD("oneair", "Auto CO2 update: ppm=%.1f night=%s -> speed=%d", ppm, id(night_mode).state ? "true" : "false", speed);
+            - if:
+                condition:
+                  lambda: "return id(auto_effective_speed) <= 0;"
+                then:
+                  - script.execute: device_power_off
+                else:
+                  - script.execute: co2_night_led_update
+                  - if:
+                      condition:
+                        lambda: "return !id(fan_running_flag) || !id(fan_output).state || !id(fan_physical_allowed);"
+                      then:
+                        - script.execute: active_fan_start_after_shutter
+                      else:
+                        - lambda: |-
+                            auto call = id(fan_output).turn_on();
+                            call.set_speed(id(auto_effective_speed));
+                            call.perform();
+                  - if:
+                      condition:
+                        lambda: "return id(heat_mode_request_level) > 0;"
+                      then:
+                        - lambda: 'id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_AUTO);'
+                      else:
+                        - lambda: 'id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_AUTO);'
+                  - script.execute: speed_led_update_from_current_state
+
+  - id: co2_night_led_update
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(auto_mode_flag) && (!id(night_mode).state || id(night_display_awake_flag));"
+          then:
+            - lambda: |-
+                const float ppm = id(co2_pwm_estimate).state;
+                ESP_LOGD("oneair", "CO2/Night LED update: ppm=%.1f", ppm);
+            # >=1800 ppm: бордовый плавно мигает.
+            - if:
+                condition:
+                  lambda: |-
+                    const float ppm = id(co2_pwm_estimate).state;
+                    return !isnan(ppm) && ppm >= 1800.0f;
+                then:
+                  - script.execute: co2_alarm_blink
+                else:
+                  - script.stop: co2_alarm_blink
+                  # <500 ppm: зелёный.
+                  - if:
+                      condition:
+                        lambda: |-
+                          const float ppm = id(co2_pwm_estimate).state;
+                          return !isnan(ppm) && ppm < 500.0f;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_1
+                            brightness: ${co2_led_brightness}
+                            red: 0%
+                            green: 100%
+                            blue: 0%
+                            transition_length: 350ms
+                  # 500–800 ppm: светло-зелёный.
+                  - if:
+                      condition:
+                        lambda: |-
+                          const float ppm = id(co2_pwm_estimate).state;
+                          return !isnan(ppm) && ppm >= 500.0f && ppm < 800.0f;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_1
+                            brightness: ${co2_led_brightness}
+                            red: 45%
+                            green: 100%
+                            blue: 0%
+                            transition_length: 350ms
+                  # 800–1200 ppm: жёлтый.
+                  - if:
+                      condition:
+                        lambda: |-
+                          const float ppm = id(co2_pwm_estimate).state;
+                          return !isnan(ppm) && ppm >= 800.0f && ppm < 1200.0f;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_1
+                            brightness: ${co2_led_brightness}
+                            red: 100%
+                            green: 80%
+                            blue: 0%
+                            transition_length: 350ms
+                  # 1200–1600 ppm: оранжевый.
+                  - if:
+                      condition:
+                        lambda: |-
+                          const float ppm = id(co2_pwm_estimate).state;
+                          return !isnan(ppm) && ppm >= 1200.0f && ppm < 1600.0f;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_1
+                            brightness: ${co2_led_brightness}
+                            red: 100%
+                            green: 35%
+                            blue: 0%
+                            transition_length: 350ms
+                  # 1600–1800 ppm: бордовый постоянный.
+                  - if:
+                      condition:
+                        lambda: |-
+                          const float ppm = id(co2_pwm_estimate).state;
+                          return !isnan(ppm) && ppm >= 1600.0f && ppm < 1800.0f;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_1
+                            brightness: ${co2_led_brightness}
+                            red: 70%
+                            green: 0%
+                            blue: 15%
+                            transition_length: 350ms
+                  # CO₂ недоступен: тусклый красный индикатор, скорость Quiet.
+                  - if:
+                      condition:
+                        lambda: |-
+                          const float ppm = id(co2_pwm_estimate).state;
+                          return isnan(ppm);
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_1
+                            brightness: 20%
+                            red: 100%
+                            green: 0%
+                            blue: 0%
+                            transition_length: 350ms
+
+  - id: co2_alarm_blink
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: |-
+              const float ppm = id(co2_pwm_estimate).state;
+              return id(auto_mode_flag) && (!id(night_mode).state || id(night_display_awake_flag)) && !isnan(ppm) && ppm >= 1800.0f;
+          then:
+            - light.turn_on:
+                id: oneair_panel_led_1
+                brightness: ${co2_led_brightness}
+                red: 70%
+                green: 0%
+                blue: 15%
+                transition_length: ${co2_alarm_blink_period}
+            - delay: ${co2_alarm_blink_period}
+            - light.turn_off:
+                id: oneair_panel_led_1
+                transition_length: ${co2_alarm_blink_period}
+            - delay: ${co2_alarm_blink_period}
+
+  - id: climate_publish_from_current_state
+    mode: queued
+    then:
+      - lambda: |-
+          // Синхронизация climate при изменении физических кнопок, внутренней fan-сущности
+          // или сохранённого положения шторки.
+          auto publish_swing = []() {
+            int seg = id(shutter_position_segments);
+            if (id(shutter_closed_sensor).state) seg = 0;
+            else if (id(shutter_opened_sensor).state && !id(shutter_opening_flag) && !id(shutter_closing_flag)) seg = 3;
+            if (seg < 0) seg = 0;
+            if (seg > 3) seg = 3;
+            id(oneair_climate).publish_swing_segment(seg);
+          };
+
+          if (id(eco_mode_flag)) {
+            id(oneair_climate).publish_eco_state();
+            publish_swing();
+            return;
+          }
+
+          if (!id(fan_output).state || !id(fan_running_flag)) {
+            id(oneair_climate).publish_off_state();
+            publish_swing();
+            return;
+          }
+
+          bool heat = id(heat_mode_request_level) > 0;
+          if (id(auto_mode_flag)) {
+            if (heat) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_AUTO);
+            else id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_AUTO);
+            publish_swing();
+            return;
+          }
+
+          int sp = id(fan_target_speed);
+          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+
+          if (sp == 1) {
+            if (heat) id(oneair_climate).publish_heat_state("Quiet");
+            else id(oneair_climate).publish_fan_only_state("Quiet");
+          } else if (sp == 2) {
+            if (heat) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_LOW);
+            else id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_LOW);
+          } else if (sp == 3) {
+            if (heat) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_MEDIUM);
+            else id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_MEDIUM);
+          } else if (sp == 4) {
+            if (heat) id(oneair_climate).publish_heat_state_standard(climate::CLIMATE_FAN_HIGH);
+            else id(oneair_climate).publish_fan_only_state_standard(climate::CLIMATE_FAN_HIGH);
+          } else {
+            if (heat) id(oneair_climate).publish_heat_state("Turbo");
+            else id(oneair_climate).publish_fan_only_state("Turbo");
+          }
+          publish_swing();
+      - script.execute: speed_led_update_from_current_state
+
+  - id: climate_publish_shutter_from_current_state
+    mode: queued
+    then:
+      - lambda: |-
+          // Синхронизация swing mode climate с сохранённым дискретным положением шторки.
+          // Соответствие: 0=OFF/закрыто, 1=HORIZONTAL/25%, 2=VERTICAL/75%, 3=BOTH/открыто.
+          int seg = id(shutter_position_segments);
+          if (id(shutter_closed_sensor).state) {
+            seg = 0;
+          } else if (id(shutter_opened_sensor).state && !id(shutter_opening_flag) && !id(shutter_closing_flag)) {
+            seg = 3;
+          }
+          if (seg < 0) seg = 0;
+          if (seg > 3) seg = 3;
+          id(oneair_climate).publish_swing_segment(seg);
+
+  - id: active_fan_start_after_shutter
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return !id(eco_mode_flag);"
+          then:
+            - lambda: |-
+                id(power_on_flag) = true;
+                id(fan_starting_sequence_flag) = true;
+                id(fan_physical_allowed) = false;
+                if (id(pending_fan_speed) < 1 || id(pending_fan_speed) > 5) id(pending_fan_speed) = 2;
+            - script.stop: eco_led_animation
+            - light.turn_off: oneair_panel_leds_all
+            - script.execute: fan_physical_off
+            - if:
+                condition:
+                  binary_sensor.is_off: shutter_opened_sensor
+                then:
+                  - script.execute: shutter_move_to_segment_3_script
+                  # Полный ход из закрытого: 3 сегмента + дожим открытия.
+                  - delay: 14s
+            - if:
+                condition:
+                  lambda: "return !id(eco_mode_flag);"
+                then:
+                  - logger.log: "Shutter is open: physical fan start is now allowed"
+                  - lambda: |-
+                      id(fan_physical_allowed) = true;
+                      id(fan_starting_sequence_flag) = false;
+                  - lambda: |-
+                      auto call = id(fan_output).turn_on();
+                      call.set_speed(id(pending_fan_speed));
+                      call.perform();
+          else:
+            - logger.log: "Active fan start skipped: Eco is active"
+  - id: speed_led_update_from_current_state
+    mode: restart
+    then:
+      # Eco использует отдельную анимацию на всех 6 LED; этот скрипт её не перезаписывает.
+      # Auto использует те же 3 LED скорости по фактически выбранной скорости CO₂.
+      - if:
+          condition:
+            lambda: "return id(eco_mode_flag) || (id(night_mode).state && !id(night_display_awake_flag));"
+          then:
+            - logger.log: "Speed LED update skipped: Eco animation or dimmed Night panel active"
+          else:
+            # Порядок панели зеркальный: LED скорости — LED6/LED5/LED4, Night — LED1.
+            - light.turn_off: oneair_panel_led_6
+            - light.turn_off: oneair_panel_led_5
+            - light.turn_off: oneair_panel_led_4
+            # Здесь не изменяются LED1/LED2/LED3:
+            # LED1 — Night/CO₂, LED2/LED3 — индикация Heat.
+            - if:
+                condition:
+                  lambda: |-
+                    return id(power_on_flag) || id(fan_running_flag) || id(fan_starting_sequence_flag) || id(fan_output).state;
+                then:
+                  # Quiet: три LED скорости, бирюзовый.
+                  - if:
+                      condition:
+                        lambda: |-
+                          int sp = id(auto_mode_flag) ? id(auto_effective_speed) : (id(fan_starting_sequence_flag) ? id(pending_fan_speed) : id(fan_target_speed));
+                          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+                          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+                          return sp == 1;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_6
+                            brightness: ${speed_led_brightness}
+                            red: 0%
+                            green: 95%
+                            blue: 85%
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_5
+                            brightness: ${speed_led_brightness}
+                            red: 0%
+                            green: 95%
+                            blue: 85%
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_4
+                            brightness: ${speed_led_brightness}
+                            red: 0%
+                            green: 95%
+                            blue: 85%
+                            transition_length: 150ms
+                  # Low: один LED скорости, жёлтый.
+                  - if:
+                      condition:
+                        lambda: |-
+                          int sp = id(auto_mode_flag) ? id(auto_effective_speed) : (id(fan_starting_sequence_flag) ? id(pending_fan_speed) : id(fan_target_speed));
+                          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+                          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+                          return sp == 2;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_6
+                            brightness: ${speed_led_brightness}
+                            red: 100%
+                            green: 75%
+                            blue: 0%
+                            transition_length: 150ms
+                  # Medium: два LED скорости, зелёный.
+                  - if:
+                      condition:
+                        lambda: |-
+                          int sp = id(auto_mode_flag) ? id(auto_effective_speed) : (id(fan_starting_sequence_flag) ? id(pending_fan_speed) : id(fan_target_speed));
+                          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+                          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+                          return sp == 3;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_6
+                            brightness: ${speed_led_brightness}
+                            red: 0%
+                            green: 100%
+                            blue: 0%
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_5
+                            brightness: ${speed_led_brightness}
+                            red: 0%
+                            green: 100%
+                            blue: 0%
+                            transition_length: 150ms
+                  # High: три LED скорости, синий.
+                  - if:
+                      condition:
+                        lambda: |-
+                          int sp = id(auto_mode_flag) ? id(auto_effective_speed) : (id(fan_starting_sequence_flag) ? id(pending_fan_speed) : id(fan_target_speed));
+                          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+                          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+                          return sp == 4;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_6
+                            brightness: ${speed_led_brightness}
+                            red: 0%
+                            green: 0%
+                            blue: 100%
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_5
+                            brightness: ${speed_led_brightness}
+                            red: 0%
+                            green: 0%
+                            blue: 100%
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_4
+                            brightness: ${speed_led_brightness}
+                            red: 0%
+                            green: 0%
+                            blue: 100%
+                            transition_length: 150ms
+                  # Turbo: три LED скорости, фиолетовый.
+                  - if:
+                      condition:
+                        lambda: |-
+                          int sp = id(auto_mode_flag) ? id(auto_effective_speed) : (id(fan_starting_sequence_flag) ? id(pending_fan_speed) : id(fan_target_speed));
+                          if (sp < 1 || sp > 5) sp = id(pending_fan_speed);
+                          if (sp < 1 || sp > 5) sp = id(fan_output).speed;
+                          return sp == 5;
+                      then:
+                        - light.turn_on:
+                            id: oneair_panel_led_6
+                            brightness: ${speed_led_brightness}
+                            red: 75%
+                            green: 0%
+                            blue: 100%
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_5
+                            brightness: ${speed_led_brightness}
+                            red: 75%
+                            green: 0%
+                            blue: 100%
+                            transition_length: 150ms
+                        - light.turn_on:
+                            id: oneair_panel_led_4
+                            brightness: ${speed_led_brightness}
+                            red: 75%
+                            green: 0%
+                            blue: 100%
+                            transition_length: 150ms
+
+  - id: eco_led_animation
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: "return id(eco_mode_flag);"
+          then:
+            # Направление: 3 LED Speed -> 2 LED Heat -> 1 LED Night. Физический порядок: LED6 -> LED1.
+            # Цвет: светло-голубой.
+            - light.turn_off:
+                id: oneair_panel_leds_all
+                transition_length: 250ms
+            - light.turn_on:
+                id: oneair_panel_led_6
+                brightness: ${eco_led_brightness}
+                red: 25%
+                green: 85%
+                blue: 100%
+                transition_length: 350ms
+            - delay: ${eco_led_step_delay}
+            - light.turn_off: oneair_panel_led_6
+            - light.turn_on:
+                id: oneair_panel_led_5
+                brightness: ${eco_led_brightness}
+                red: 25%
+                green: 85%
+                blue: 100%
+                transition_length: 350ms
+            - delay: ${eco_led_step_delay}
+            - light.turn_off: oneair_panel_led_5
+            - light.turn_on:
+                id: oneair_panel_led_4
+                brightness: ${eco_led_brightness}
+                red: 25%
+                green: 85%
+                blue: 100%
+                transition_length: 350ms
+            - delay: ${eco_led_step_delay}
+            - light.turn_off: oneair_panel_led_4
+            - light.turn_on:
+                id: oneair_panel_led_3
+                brightness: ${eco_led_brightness}
+                red: 25%
+                green: 85%
+                blue: 100%
+                transition_length: 350ms
+            - delay: ${eco_led_step_delay}
+            - light.turn_off: oneair_panel_led_3
+            - light.turn_on:
+                id: oneair_panel_led_2
+                brightness: ${eco_led_brightness}
+                red: 25%
+                green: 85%
+                blue: 100%
+                transition_length: 350ms
+            - delay: ${eco_led_step_delay}
+            - light.turn_off: oneair_panel_led_2
+            - light.turn_on:
+                id: oneair_panel_led_1
+                brightness: ${eco_led_brightness}
+                red: 25%
+                green: 85%
+                blue: 100%
+                transition_length: 350ms
+            - delay: ${eco_led_step_delay}
+            - light.turn_off: oneair_panel_led_1
+
+  - id: night_panel_wake
+    mode: restart
+    then:
+      - if:
+          condition:
+            switch.is_on: night_mode
+          then:
+            - lambda: |-
+                id(night_display_awake_flag) = true;
+            - script.stop: night_panel_dim_timer
+            # Пока подсветка активна, текущее состояние отображается с ночной яркостью.
+            - if:
+                condition:
+                  lambda: "return id(auto_mode_flag);"
+                then:
+                  - script.execute: co2_night_led_update
+                else:
+                  - light.turn_on:
+                      id: oneair_panel_led_1
+                      brightness: ${night_led_awake_brightness}
+                      red: 0%
+                      green: 0%
+                      blue: 100%
+                      transition_length: 150ms
+            - script.execute: speed_led_update_from_current_state
+            - script.execute: heat_led_update
+            - script.execute: night_panel_dim_timer
+
+  - id: night_panel_dim_timer
+    mode: restart
+    then:
+      - delay: ${night_panel_dim_delay}
+      - if:
+          condition:
+            switch.is_on: night_mode
+          then:
+            - script.execute: night_panel_dim
+
+  - id: night_panel_dim
+    mode: restart
+    then:
+      - if:
+          condition:
+            switch.is_on: night_mode
+          then:
+            - logger.log: "Night mode: panel dimmed"
+            - lambda: |-
+                id(night_display_awake_flag) = false;
+            - script.stop: co2_alarm_blink
+            - light.turn_off:
+                id: oneair_panel_leds_all
+                transition_length: 600ms
+            - light.turn_on:
+                id: oneair_panel_led_1
+                brightness: ${night_led_dim_brightness}
+                red: 0%
+                green: 0%
+                blue: 100%
+                transition_length: 600ms
+
+  - id: long_press_confirm_beep
+    mode: restart
+    then:
+      # Подтверждающий сигнал для действий по долгому удержанию.
+      # В отличие от обычного button_beep, сигнал разрешён при активном ночном режиме,
+      # чтобы подтвердить принятие удержания 3 секунды.
+      - if:
+          condition:
+            switch.is_on: sound_enable
+          then:
+            - rtttl.stop
+            - rtttl.play: 'hold:d=16,o=6,b=180:c6,g6'
+            - delay: 250ms
+
+  - id: button_beep
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(sound_enable).state && !id(night_mode).state;"
+          then:
+            - rtttl.stop
+            - rtttl.play: 'beep:d=32,o=6,b=180:c6'
+
+  - id: sound_test_melody
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return !id(night_mode).state;"
+          then:
+            - rtttl.stop
+            - rtttl.play: 'test:d=16,o=6,b=140:c6,e6,g6,c7'
+
+  - id: shutter_closed_endstop_script
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return id(shutter_closing_flag);"
+          then:
+            - logger.log: "Shutter CLOSED endstop active while closing: extra close steps for full mechanical close"
+            # Датчик срабатывает перед полным механическим закрытием шторки.
+            # Точка срабатывания принимается за логический 0, затем выполняется дожим,
+            # после чего положение синхронизируется обратно в 0.
+            - stepper.report_position:
+                id: shutter_stepper
+                position: 0
+            - stepper.set_target:
+                id: shutter_stepper
+                target: !lambda "return -(int) id(shutter_close_extra_steps).state;"
+            - delay: ${shutter_close_extra_delay}
+            - stepper.report_position:
+                id: shutter_stepper
+                position: 0
+            - stepper.set_target:
+                id: shutter_stepper
+                target: 0
+            - lambda: |-
+                id(shutter_opening_flag) = false;
+                id(shutter_closing_flag) = false;
+                id(shutter_position_segments) = 0;
+                id(shutter_target_segments) = 0;
+            - cover.template.publish:
+                id: shutter_cover
+                position: 0.0
+                current_operation: IDLE
+            - script.execute: climate_publish_shutter_from_current_state
+          else:
+            - logger.log: "Концевик закрытия активен: шторка и шаговый двигатель синхронизированы с закрытым положением"
+            - stepper.report_position:
+                id: shutter_stepper
+                position: 0
+            - stepper.set_target:
+                id: shutter_stepper
+                target: 0
+            - lambda: |-
+                id(shutter_opening_flag) = false;
+                id(shutter_closing_flag) = false;
+                id(shutter_position_segments) = 0;
+            - cover.template.publish:
+                id: shutter_cover
+                position: 0.0
+                current_operation: IDLE
+            - script.execute: climate_publish_shutter_from_current_state
+      - logger.log: "Shutter closed: fan/heater are not stopped by this sensor in this build"
+
+  - id: shutter_opened_endstop_script
+    mode: restart
+    then:
+      - if:
+          condition:
+            # Принудительная синхронизация 100% выполняется только при движении к конечному положению 100%.
+            # Это сохраняет корректные положения 25% и 75%.
+            lambda: "return id(shutter_opening_flag) && id(shutter_target_segments) == 3;"
+          then:
+            - logger.log: "Концевик полного открытия активен при движении к полному открытию: выполняется дожим и синхронизация открытого положения"
+            - script.stop: shutter_move_to_segment_1_script
+            - script.stop: shutter_move_to_segment_2_script
+            - script.stop: shutter_move_to_segment_3_script
+            # Датчик открытия срабатывает перед конечным механическим положением.
+            # Оставшаяся часть сегмента останавливается, затем выполняется короткий настраиваемый дожим,
+            # после чего сохранённое положение нормализуется как полностью открытое.
+            - stepper.set_target:
+                id: shutter_stepper
+                target: !lambda "return id(shutter_stepper).current_position + (int) id(shutter_open_extra_steps).state;"
+            - delay: ${shutter_open_extra_delay}
+            - lambda: |-
+                id(shutter_opening_flag) = false;
+                id(shutter_closing_flag) = false;
+                id(shutter_position_segments) = 3;
+                id(shutter_target_segments) = 3;
+            - stepper.report_position:
+                id: shutter_stepper
+                position: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+            - stepper.set_target:
+                id: shutter_stepper
+                target: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+            - cover.template.publish:
+                id: shutter_cover
+                position: 1.0
+                current_operation: IDLE
+            - script.execute: climate_publish_shutter_from_current_state
+          else:
+            - if:
+                condition:
+                  lambda: "return !id(shutter_opening_flag);"
+                then:
+                  - logger.log: "Концевик полного открытия активен в состоянии ожидания: шторка и шаговый двигатель синхронизированы с полностью открытым положением"
+                  - lambda: |-
+                      id(shutter_opening_flag) = false;
+                      id(shutter_closing_flag) = false;
+                      id(shutter_position_segments) = 3;
+                      id(shutter_target_segments) = 3;
+                  - stepper.report_position:
+                      id: shutter_stepper
+                      position: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+                  - stepper.set_target:
+                      id: shutter_stepper
+                      target: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+                  - cover.template.publish:
+                      id: shutter_cover
+                      position: 1.0
+                      current_operation: IDLE
+                  - script.execute: climate_publish_shutter_from_current_state
+                else:
+                  - logger.log: "Концевик полного открытия проигнорирован: целевая позиция не полное открытие, сохраняется логика положений 25 и 75 процентов"
+
+  # Перемещение шторки в дискретное положение 25% = 1 сегмент.
+  - id: shutter_move_to_segment_1_script
+    mode: restart
+    then:
+      - logger.log: "Шторка: перемещение в положение 25 процентов, один сегмент"
+      - lambda: |-
+          if (id(shutter_position_segments) < 0 || id(shutter_position_segments) > 3) id(shutter_position_segments) = 0;
+          if (id(shutter_closed_sensor).state) id(shutter_position_segments) = 0;
+          id(shutter_start_segments) = id(shutter_position_segments);
+          id(shutter_target_segments) = 1;
+          id(shutter_opening_flag) = (id(shutter_start_segments) < 1);
+          id(shutter_closing_flag) = (id(shutter_start_segments) > 1);
+      - if:
+          condition:
+            binary_sensor.is_on: shutter_closed_sensor
+          then:
+            - stepper.report_position:
+                id: shutter_stepper
+                position: 0
+      - if:
+          condition:
+            lambda: "return id(shutter_start_segments) < 1;"
+          then:
+            - cover.template.publish:
+                id: shutter_cover
+                current_operation: OPENING
+          else:
+            - cover.template.publish:
+                id: shutter_cover
+                current_operation: CLOSING
+      - stepper.set_target:
+          id: shutter_stepper
+          target: !lambda "return (int) roundf(id(shutter_steps).state * 1.0f);"
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 1) >= 1;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 1) >= 2;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 1) >= 3;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - stepper.report_position:
+          id: shutter_stepper
+          position: !lambda "return (int) roundf(id(shutter_steps).state * 1.0f);"
+      - stepper.set_target:
+          id: shutter_stepper
+          target: !lambda "return (int) roundf(id(shutter_steps).state * 1.0f);"
+      - lambda: |-
+          id(shutter_opening_flag) = false;
+          id(shutter_closing_flag) = false;
+          id(shutter_position_segments) = 1;
+      - cover.template.publish:
+          id: shutter_cover
+          position: 0.25
+          current_operation: IDLE
+      - script.execute: climate_publish_shutter_from_current_state
+
+  # Перемещение шторки в дискретное положение 75% = 2 сегмента.
+  - id: shutter_move_to_segment_2_script
+    mode: restart
+    then:
+      - logger.log: "Шторка: перемещение в положение 75 процентов, два сегмента"
+      - lambda: |-
+          if (id(shutter_position_segments) < 0 || id(shutter_position_segments) > 3) id(shutter_position_segments) = 0;
+          if (id(shutter_closed_sensor).state) id(shutter_position_segments) = 0;
+          id(shutter_start_segments) = id(shutter_position_segments);
+          id(shutter_target_segments) = 2;
+          id(shutter_opening_flag) = (id(shutter_start_segments) < 2);
+          id(shutter_closing_flag) = (id(shutter_start_segments) > 2);
+      - if:
+          condition:
+            binary_sensor.is_on: shutter_closed_sensor
+          then:
+            - stepper.report_position:
+                id: shutter_stepper
+                position: 0
+      - if:
+          condition:
+            lambda: "return id(shutter_start_segments) < 2;"
+          then:
+            - cover.template.publish:
+                id: shutter_cover
+                current_operation: OPENING
+          else:
+            - cover.template.publish:
+                id: shutter_cover
+                current_operation: CLOSING
+      - stepper.set_target:
+          id: shutter_stepper
+          target: !lambda "return (int) roundf(id(shutter_steps).state * 2.0f);"
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 2) >= 1;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 2) >= 2;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 2) >= 3;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - stepper.report_position:
+          id: shutter_stepper
+          position: !lambda "return (int) roundf(id(shutter_steps).state * 2.0f);"
+      - stepper.set_target:
+          id: shutter_stepper
+          target: !lambda "return (int) roundf(id(shutter_steps).state * 2.0f);"
+      - lambda: |-
+          id(shutter_opening_flag) = false;
+          id(shutter_closing_flag) = false;
+          id(shutter_position_segments) = 2;
+      - cover.template.publish:
+          id: shutter_cover
+          position: 0.75
+          current_operation: IDLE
+      - script.execute: climate_publish_shutter_from_current_state
+
+  # Перемещение шторки в дискретное положение 100% = 3 сегмента.
+  - id: shutter_move_to_segment_3_script
+    mode: restart
+    then:
+      - logger.log: "Шторка: перемещение в полностью открытое положение, три сегмента"
+      - lambda: |-
+          if (id(shutter_position_segments) < 0 || id(shutter_position_segments) > 3) id(shutter_position_segments) = 0;
+          if (id(shutter_closed_sensor).state) id(shutter_position_segments) = 0;
+          id(shutter_start_segments) = id(shutter_position_segments);
+          id(shutter_target_segments) = 3;
+          id(shutter_opening_flag) = (id(shutter_start_segments) < 3);
+          id(shutter_closing_flag) = false;
+      - if:
+          condition:
+            binary_sensor.is_on: shutter_closed_sensor
+          then:
+            - stepper.report_position:
+                id: shutter_stepper
+                position: 0
+      - cover.template.publish:
+          id: shutter_cover
+          current_operation: OPENING
+      - stepper.set_target:
+          id: shutter_stepper
+          target: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 3) >= 1;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 3) >= 2;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - if:
+          condition:
+            lambda: "return abs(id(shutter_start_segments) - 3) >= 3;"
+          then:
+            - delay: ${shutter_segment_delay}
+      - stepper.report_position:
+          id: shutter_stepper
+          position: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+      - stepper.set_target:
+          id: shutter_stepper
+          target: !lambda "return (int) roundf(id(shutter_steps).state * 3.0f);"
+      - lambda: |-
+          id(shutter_opening_flag) = false;
+          id(shutter_closing_flag) = false;
+          id(shutter_position_segments) = 3;
+      - cover.template.publish:
+          id: shutter_cover
+          position: 1.0
+          current_operation: IDLE
+      - script.execute: climate_publish_shutter_from_current_state
+
+  # Закрытие шторки до 0%. При срабатывании концевика shutter_closed_endstop_script выполняет дожим и синхронизацию в 0.
+  - id: shutter_move_to_segment_0_script
+    mode: restart
+    then:
+      - logger.log: "Шторка: перемещение в закрытое положение"
+      - if:
+          condition:
+            binary_sensor.is_on: shutter_closed_sensor
+          then:
+            - logger.log: "Cover: close requested, but shutter is already CLOSED"
+            - lambda: |-
+                id(shutter_opening_flag) = false;
+                id(shutter_closing_flag) = false;
+                id(shutter_position_segments) = 0;
+            - stepper.report_position:
+                id: shutter_stepper
+                position: 0
+            - stepper.set_target:
+                id: shutter_stepper
+                target: 0
+            - cover.template.publish:
+                id: shutter_cover
+                position: 0.0
+                current_operation: IDLE
+            - script.execute: climate_publish_shutter_from_current_state
+          else:
+            - lambda: |-
+                if (id(shutter_position_segments) < 0 || id(shutter_position_segments) > 3) id(shutter_position_segments) = 3;
+                if (id(shutter_position_segments) == 0) id(shutter_position_segments) = 3;
+                id(shutter_start_segments) = id(shutter_position_segments);
+                id(shutter_target_segments) = 0;
+                id(shutter_opening_flag) = false;
+                id(shutter_closing_flag) = true;
+            - cover.template.publish:
+                id: shutter_cover
+                current_operation: CLOSING
+            - stepper.set_target:
+                id: shutter_stepper
+                target: 0
+            - if:
+                condition:
+                  lambda: "return id(shutter_start_segments) >= 1;"
+                then:
+                  - delay: ${shutter_segment_delay}
+            - if:
+                condition:
+                  lambda: "return id(shutter_closing_flag) && id(shutter_start_segments) >= 2;"
+                then:
+                  - delay: ${shutter_segment_delay}
+            - if:
+                condition:
+                  lambda: "return id(shutter_closing_flag) && id(shutter_start_segments) >= 3;"
+                then:
+                  - delay: ${shutter_segment_delay}
+            # shutter_closed_endstop_script завершает закрытие и выполняет дополнительный дожим.
+            # Если концевик не сработал, после заданного хода положение всё равно синхронизируется как закрытое.
+            - if:
+                condition:
+                  lambda: "return id(shutter_closing_flag);"
+                then:
+                  - logger.log: "Shutter close finished without endstop event: sync as CLOSED"
+                  - lambda: |-
+                      id(shutter_opening_flag) = false;
+                      id(shutter_closing_flag) = false;
+                      id(shutter_position_segments) = 0;
+                  - stepper.report_position:
+                      id: shutter_stepper
+                      position: 0
+                  - stepper.set_target:
+                      id: shutter_stepper
+                      target: 0
+                  - cover.template.publish:
+                      id: shutter_cover
+                      position: 0.0
+                      current_operation: IDLE
+                  - script.execute: climate_publish_shutter_from_current_state
+
+  # Имена для совместимости с диагностическими кнопками предыдущих версий.
+  - id: shutter_open_script
+    mode: restart
+    then:
+      - script.execute: shutter_move_to_segment_3_script
+
+  - id: shutter_half_open_script
+    mode: restart
+    then:
+      - script.execute: shutter_move_to_segment_2_script
+
+  - id: shutter_close_script
+    mode: restart
+    then:
+      - script.execute: shutter_move_to_segment_0_script
+
+  - id: shutter_stop_script
+    mode: restart
+    then:
+      - logger.log: "Cover: stop shutter"
+      - lambda: |-
+          id(shutter_opening_flag) = false;
+          id(shutter_closing_flag) = false;
+      - stepper.set_target:
+          id: shutter_stepper
+          target: !lambda "return id(shutter_stepper).current_position;"
+      - lambda: |-
+          const float steps = id(shutter_steps).state;
+          if (steps <= 0.0f) {
+            id(shutter_position_segments) = 0;
+          } else {
+            int seg = (int) roundf(((float) id(shutter_stepper).current_position) / steps);
+            if (seg < 0) seg = 0;
+            if (seg > 3) seg = 3;
+            id(shutter_position_segments) = seg;
+          }
+      - cover.template.publish:
+          id: shutter_cover
+          position: !lambda |-
+            if (id(shutter_position_segments) <= 0) return 0.0f;
+            if (id(shutter_position_segments) == 1) return 0.25f;
+            if (id(shutter_position_segments) == 2) return 0.75f;
+            return 1.0f;
+          current_operation: IDLE
+      - script.execute: climate_publish_shutter_from_current_state
+
+  - id: fan_physical_off
+    mode: restart
+    then:
+      - logger.log: "Fan physical OFF: PWM stop level and enable OFF"
+      - output.ledc.set_frequency:
+          id: fan_pwm_out
+          frequency: ${fan_pwm_default_frequency}
+      # Для инвертированной PWM-линии 100% является физическим стоп-уровнем.
+      - output.set_level:
+          id: fan_pwm_out
+          level: 100%
+      - output.set_level:
+          id: fan_enable_out
+          level: 0%
+      - lambda: |-
+          id(fan_running_flag) = false;
+          id(fan_last_speed) = 0;
+
+  - id: fan_all_off
+    mode: restart
+    then:
+      - script.execute: heater_all_off
+      - script.execute: fan_physical_off
+      - lambda: |-
+          id(fan_target_speed) = 0;
+          id(auto_mode_flag) = false;
+          id(fan_physical_allowed) = false;
+          id(fan_starting_sequence_flag) = false;
+
+  - id: heater_all_off
+    mode: restart
+    then:
+      - logger.log: "Heater OFF: GPIO25/GPIO26 OFF"
+      - output.turn_off: heater_2_out
+      - output.turn_off: heater_1_out
+      - lambda: |-
+          id(heater_stage_2_flag) = false;
+          id(heater_stage_1_flag) = false;
+          id(heat_mode_select).publish_state("Off");
+
+  - id: heater_low_on
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return !id(power_on_flag) || id(eco_mode_flag);"
+          then:
+            - logger.log: "Heat LOW requested while device/Eco is not in active mode: switching device ON first"
+            - script.execute: device_power_on
+            - delay: 12s
+      - if:
+          condition:
+            fan.is_off: fan_output
+          then:
+            - logger.log: "Heat LOW requested: fan is OFF, starting fan LOW first"
+            - fan.turn_on:
+                id: fan_output
+                speed: 2
+            - delay: ${heater_start_delay}
+      - if:
+          condition:
+            lambda: "return id(fan_target_speed) == 1 || id(fan_output).speed == 1;"
+          then:
+            - logger.log: "Heat LOW requested: Quiet is unsafe, switching fan to LOW"
+            - fan.turn_on:
+                id: fan_output
+                speed: 2
+            - delay: 1000ms
+      - if:
+          condition:
+            fan.is_on: fan_output
+          then:
+            - logger.log: "Heat LOW ON: GPIO25 only, measured about 360 W"
+            - output.turn_off: heater_2_out
+            - delay: 200ms
+            - output.turn_on: heater_1_out
+            - lambda: |-
+                id(heater_stage_1_flag) = true;
+                id(heater_stage_2_flag) = false;
+                id(heat_mode_select).publish_state("Low");
+            - script.execute: climate_publish_from_current_state
+          else:
+            - logger.log: "Heat LOW blocked: fan is still OFF"
+            - script.execute: heater_all_off
+
+  - id: heater_high_on
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: "return !id(power_on_flag) || id(eco_mode_flag);"
+          then:
+            - logger.log: "Heat HIGH requested while device/Eco is not in active mode: switching device ON first"
+            - script.execute: device_power_on
+            - delay: 12s
+      - if:
+          condition:
+            fan.is_off: fan_output
+          then:
+            - logger.log: "Heat HIGH requested: fan is OFF, starting fan LOW first"
+            - fan.turn_on:
+                id: fan_output
+                speed: 2
+            - delay: ${heater_start_delay}
+      - if:
+          condition:
+            lambda: "return id(fan_target_speed) == 1 || id(fan_output).speed == 1;"
+          then:
+            - logger.log: "Heat HIGH requested: Quiet is unsafe, switching fan to LOW"
+            - fan.turn_on:
+                id: fan_output
+                speed: 2
+            - delay: 1000ms
+      - if:
+          condition:
+            fan.is_on: fan_output
+          then:
+            - logger.log: "Heat HIGH ON: GPIO25 + GPIO26, measured about 880 W"
+            - output.turn_on: heater_1_out
+            - delay: 300ms
+            - output.turn_on: heater_2_out
+            - lambda: |-
+                id(heater_stage_1_flag) = true;
+                id(heater_stage_2_flag) = true;
+                id(heat_mode_select).publish_state("High");
+            - script.execute: climate_publish_from_current_state
+          else:
+            - logger.log: "Heat HIGH blocked: fan is still OFF"
+            - script.execute: heater_all_off
+
+  - id: fan_apply_current_speed
+    mode: restart
+    then:
+      - if:
+          condition:
+            fan.is_on: fan_output
+          then:
+            - logger.log: "Re-applying current fan speed after config change"
+            - lambda: |-
+                auto call = id(fan_output).turn_on();
+                call.set_speed(id(fan_output).speed);
+                call.perform();
+
+
+  - id: panel_led_chase_test
+    mode: restart
+    then:
+      - light.turn_off: oneair_panel_leds_all
+      - delay: 200ms
+      - light.turn_on:
+          id: oneair_panel_led_1
+          brightness: 70%
+          red: 100%
+          green: 100%
+          blue: 100%
+      - delay: 500ms
+      - light.turn_off: oneair_panel_led_1
+      - light.turn_on:
+          id: oneair_panel_led_2
+          brightness: 70%
+          red: 100%
+          green: 100%
+          blue: 100%
+      - delay: 500ms
+      - light.turn_off: oneair_panel_led_2
+      - light.turn_on:
+          id: oneair_panel_led_3
+          brightness: 70%
+          red: 100%
+          green: 100%
+          blue: 100%
+      - delay: 500ms
+      - light.turn_off: oneair_panel_led_3
+      - light.turn_on:
+          id: oneair_panel_led_4
+          brightness: 70%
+          red: 100%
+          green: 100%
+          blue: 100%
+      - delay: 500ms
+      - light.turn_off: oneair_panel_led_4
+      - light.turn_on:
+          id: oneair_panel_led_5
+          brightness: 70%
+          red: 100%
+          green: 100%
+          blue: 100%
+      - delay: 500ms
+      - light.turn_off: oneair_panel_led_5
+      - light.turn_on:
+          id: oneair_panel_led_6
+          brightness: 70%
+          red: 100%
+          green: 100%
+          blue: 100%
+      - delay: 500ms
+      - light.turn_off: oneair_panel_led_6
+
+select:
+  - platform: template
+    id: heat_mode_select
+    name: ${dev_name}_heat_mode
+    internal: true
+    icon: "mdi:heat-wave"
+    options:
+      - "Off"
+      - "Low"
+      - "High"
+    initial_option: "Off"
+    optimistic: false
+    restore_value: false
+    set_action:
+      - if:
+          condition:
+            lambda: 'return x == "Off";'
+          then:
+            - script.execute: heater_all_off
+      - if:
+          condition:
+            lambda: 'return x == "Low";'
+          then:
+            - script.execute: heater_low_on
+      - if:
+          condition:
+            lambda: 'return x == "High";'
+          then:
+            - script.execute: heater_high_on
+
+switch:
+  - platform: template
+    id: sound_enable
+    name: ${dev_name}_sound
+    internal: true
+    icon: "mdi:volume-high"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    entity_category: config
+
+
+
+  - platform: template
+    id: night_mode
+    name: Night Mode
+    icon: "mdi:weather-night"
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - logger.log: "Night mode ON: sounds muted, panel will dim after 30 seconds"
+      - script.stop: eco_led_animation
+      - lambda: |-
+          id(night_display_awake_flag) = true;
+      # Ночной режим автоматически использует CO₂ Auto и ограничивает скорость уровнем Medium.
+      - script.execute: auto_mode_on
+      - script.execute: night_panel_wake
+    turn_off_action:
+      - logger.log: "Night mode OFF: restore ordinary indication"
+      - lambda: |-
+          id(night_display_awake_flag) = false;
+      - script.stop: night_panel_dim_timer
+      - script.stop: co2_alarm_blink
+      - light.turn_off: oneair_panel_led_1
+      - script.execute: speed_led_update_from_current_state
+      - script.execute: heat_led_update
+      - if:
+          condition:
+            lambda: "return id(auto_mode_flag);"
+          then:
+            - script.execute: co2_night_led_update
+
+button:
+  - platform: safe_mode
+    name: ${dev_name}_safe_mode
+    internal: true
+
+  - platform: restart
+    name: ${dev_name}_restart
+    internal: true
+
+  - platform: template
+    name: Reset Prefilter Runtime
+    icon: "mdi:filter-remove"
+    entity_category: config
+    on_press:
+      - logger.log: "Reset prefilter runtime counter"
+      - lambda: |-
+          id(prefilter_runtime_seconds) = 0;
+          id(prefilter_runtime_hours_sensor).publish_state(0.0f);
+
+  - platform: template
+    name: Reset Main Filter Runtime
+    icon: "mdi:filter-remove-outline"
+    entity_category: config
+    on_press:
+      - logger.log: "Reset main filter runtime counter"
+      - lambda: |-
+          id(main_filter_runtime_seconds) = 0;
+          id(main_filter_runtime_hours_sensor).publish_state(0.0f);
+
+  - platform: template
+    name: ${dev_name}_sound_test
+    internal: true
+    icon: "mdi:volume-high"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: sound_test_melody
+
+  - platform: template
+    name: ${dev_name}_panel_leds_test_white
+    internal: true
+    icon: "mdi:led-strip-variant"
+    entity_category: diagnostic
+    on_press:
+      - light.turn_on:
+          id: oneair_panel_leds_all
+          brightness: 50%
+          red: 100%
+          green: 100%
+          blue: 100%
+
+  - platform: template
+    name: ${dev_name}_panel_leds_test_red
+    internal: true
+    icon: "mdi:led-strip-variant"
+    entity_category: diagnostic
+    on_press:
+      - light.turn_on:
+          id: oneair_panel_leds_all
+          brightness: 50%
+          red: 100%
+          green: 0%
+          blue: 0%
+
+  - platform: template
+    name: ${dev_name}_panel_leds_test_green
+    internal: true
+    icon: "mdi:led-strip-variant"
+    entity_category: diagnostic
+    on_press:
+      - light.turn_on:
+          id: oneair_panel_leds_all
+          brightness: 50%
+          red: 0%
+          green: 100%
+          blue: 0%
+
+  - platform: template
+    name: ${dev_name}_panel_leds_test_blue
+    internal: true
+    icon: "mdi:led-strip-variant"
+    entity_category: diagnostic
+    on_press:
+      - light.turn_on:
+          id: oneair_panel_leds_all
+          brightness: 50%
+          red: 0%
+          green: 0%
+          blue: 100%
+
+  - platform: template
+    name: ${dev_name}_panel_leds_chase_test
+    internal: true
+    icon: "mdi:led-strip-variant"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: panel_led_chase_test
+
+  - platform: template
+    name: ${dev_name}_panel_leds_off
+    internal: true
+    icon: "mdi:led-off"
+    entity_category: diagnostic
+    on_press:
+      - light.turn_off: oneair_panel_leds_all
+
+  - platform: template
+    name: ${dev_name}_fan_force_off
+    internal: true
+    icon: "mdi:fan-off"
+    entity_category: diagnostic
+    on_press:
+      - fan.turn_off: fan_output
+      - script.execute: fan_all_off
+
+  - platform: template
+    name: ${dev_name}_heater_all_off
+    internal: true
+    icon: "mdi:heat-wave"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: heater_all_off
+
+  - platform: template
+    name: ${dev_name}_fan_apply_current_settings
+    internal: true
+    icon: "mdi:fan-sync"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: fan_apply_current_speed
+
+  - platform: template
+    name: ${dev_name}_shutter_open
+    internal: true
+    icon: "mdi:window-shutter-open"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: shutter_open_script
+
+  - platform: template
+    name: ${dev_name}_shutter_close
+    internal: true
+    icon: "mdi:window-shutter"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: shutter_close_script
+
+  - platform: template
+    name: ${dev_name}_shutter_25_open
+    internal: true
+    icon: "mdi:window-shutter-open"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: shutter_move_to_segment_1_script
+
+  - platform: template
+    name: ${dev_name}_shutter_75_open
+    internal: true
+    icon: "mdi:window-shutter-open"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: shutter_move_to_segment_2_script
+
+  - platform: template
+    name: ${dev_name}_shutter_stop
+    internal: true
+    icon: "mdi:stop"
+    entity_category: diagnostic
+    on_press:
+      - script.execute: shutter_stop_script
+
+  - platform: template
+    name: ${dev_name}_shutter_test_open_100_steps
+    internal: true
+    icon: "mdi:debug-step-over"
+    entity_category: diagnostic
+    on_press:
+      - stepper.report_position:
+          id: shutter_stepper
+          position: 0
+      - stepper.set_target:
+          id: shutter_stepper
+          target: 100
+
+  - platform: template
+    name: ${dev_name}_shutter_test_close_100_steps
+    internal: true
+    icon: "mdi:debug-step-over"
+    entity_category: diagnostic
+    on_press:
+      - stepper.report_position:
+          id: shutter_stepper
+          position: 0
+      - stepper.set_target:
+          id: shutter_stepper
+          target: -100
